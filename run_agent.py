@@ -7718,6 +7718,7 @@ class AIAgent:
                 limit=function_args.get("limit", 3),
                 db=self._session_db,
                 current_session_id=self.session_id,
+                enterprise_scope=self.enterprise_scope,
             )
         elif function_name == "memory":
             target = function_args.get("target", "memory")
@@ -8226,6 +8227,7 @@ class AIAgent:
                         limit=function_args.get("limit", 3),
                         db=self._session_db,
                         current_session_id=self.session_id,
+                        enterprise_scope=self.enterprise_scope,
                     )
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():

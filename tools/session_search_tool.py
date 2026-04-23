@@ -22,6 +22,7 @@ import logging
 import re
 from typing import Dict, Any, List, Optional, Union
 
+from agent.scope import EnterpriseScope
 from agent.auxiliary_client import async_call_llm, extract_content_or_reasoning
 MAX_SESSION_CHARS = 100_000
 MAX_SUMMARY_TOKENS = 10000
@@ -263,25 +264,68 @@ async def _summarize_session(
 _HIDDEN_SESSION_SOURCES = ("tool",)
 
 
-def _list_recent_sessions(db, limit: int, current_session_id: str = None) -> str:
+def _scope_matches_session(
+    session: Optional[Dict[str, Any]],
+    enterprise_scope: Optional[EnterpriseScope],
+) -> bool:
+    if not enterprise_scope or not enterprise_scope.is_scoped():
+        return True
+    if not session:
+        return False
+    return (
+        (session.get("tenant_id") or None),
+        (session.get("workspace_id") or None),
+        (session.get("agent_id") or None),
+    ) == (
+        enterprise_scope.tenant_id or None,
+        enterprise_scope.workspace_id or None,
+        enterprise_scope.agent_id or "main",
+    )
+
+
+def _resolve_lineage_root(
+    db,
+    session_id: Optional[str],
+    enterprise_scope: Optional[EnterpriseScope],
+) -> Optional[str]:
+    if not session_id:
+        return None
+
+    sid = session_id
+    resolved_sid = session_id
+    visited = set()
+    while sid and sid not in visited:
+        visited.add(sid)
+        session = db.get_session(sid)
+        if not _scope_matches_session(session, enterprise_scope):
+            break
+        resolved_sid = sid
+        parent = session.get("parent_session_id") if session else None
+        if not parent:
+            break
+        parent_session = db.get_session(parent)
+        if not _scope_matches_session(parent_session, enterprise_scope):
+            break
+        sid = parent
+    return resolved_sid
+
+
+def _list_recent_sessions(
+    db,
+    limit: int,
+    current_session_id: str = None,
+    enterprise_scope: Optional[EnterpriseScope] = None,
+) -> str:
     """Return metadata for the most recent sessions (no LLM calls)."""
     try:
-        sessions = db.list_sessions_rich(limit=limit + 5, exclude_sources=list(_HIDDEN_SESSION_SOURCES))  # fetch extra to skip current
+        sessions = db.list_sessions_rich(
+            limit=limit + 5,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            enterprise_scope=enterprise_scope,
+        )  # fetch extra to skip current
 
         # Resolve current session lineage to exclude it
-        current_root = None
-        if current_session_id:
-            try:
-                sid = current_session_id
-                visited = set()
-                while sid and sid not in visited:
-                    visited.add(sid)
-                    s = db.get_session(sid)
-                    parent = s.get("parent_session_id") if s else None
-                    sid = parent if parent else None
-                current_root = max(visited, key=len) if visited else current_session_id
-            except Exception:
-                current_root = current_session_id
+        current_root = _resolve_lineage_root(db, current_session_id, enterprise_scope)
 
         results = []
         for s in sessions:
@@ -321,6 +365,7 @@ def session_search(
     limit: int = 3,
     db=None,
     current_session_id: str = None,
+    enterprise_scope: Optional[EnterpriseScope] = None,
 ) -> str:
     """
     Search past sessions and return focused summaries of matching conversations.
@@ -344,7 +389,12 @@ def session_search(
     # Recent sessions mode: when query is empty, return metadata for recent sessions.
     # No LLM calls — just DB queries for titles, previews, timestamps.
     if not query or not query.strip():
-        return _list_recent_sessions(db, limit, current_session_id)
+        return _list_recent_sessions(
+            db,
+            limit,
+            current_session_id,
+            enterprise_scope=enterprise_scope,
+        )
 
     query = query.strip()
 
@@ -361,6 +411,7 @@ def session_search(
             exclude_sources=list(_HIDDEN_SESSION_SOURCES),
             limit=50,  # Get more matches to find unique sessions
             offset=0,
+            enterprise_scope=enterprise_scope,
         )
 
         if not raw_results:
@@ -375,29 +426,17 @@ def session_search(
         # Resolve child sessions to their parent — delegation stores detailed
         # content in child sessions, but the user's conversation is the parent.
         def _resolve_to_parent(session_id: str) -> str:
-            """Walk delegation chain to find the root parent session ID."""
-            visited = set()
-            sid = session_id
-            while sid and sid not in visited:
-                visited.add(sid)
-                try:
-                    session = db.get_session(sid)
-                    if not session:
-                        break
-                    parent = session.get("parent_session_id")
-                    if parent:
-                        sid = parent
-                    else:
-                        break
-                except Exception as e:
-                    logging.debug(
-                        "Error resolving parent for session %s: %s",
-                        sid,
-                        e,
-                        exc_info=True,
-                    )
-                    break
-            return sid
+            """Walk delegation chain to find the in-scope root parent session ID."""
+            try:
+                return _resolve_lineage_root(db, session_id, enterprise_scope) or session_id
+            except Exception as e:
+                logging.debug(
+                    "Error resolving parent for session %s: %s",
+                    session_id,
+                    e,
+                    exc_info=True,
+                )
+                return session_id
 
         current_lineage_root = (
             _resolve_to_parent(current_session_id) if current_session_id else None
@@ -584,7 +623,8 @@ registry.register(
         role_filter=args.get("role_filter"),
         limit=args.get("limit", 3),
         db=kw.get("db"),
-        current_session_id=kw.get("current_session_id")),
+        current_session_id=kw.get("current_session_id"),
+        enterprise_scope=kw.get("enterprise_scope")),
     check_fn=check_session_search_requirements,
     emoji="🔍",
 )

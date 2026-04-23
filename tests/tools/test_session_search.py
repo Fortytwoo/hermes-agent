@@ -5,6 +5,7 @@ import json
 import time
 import pytest
 
+from agent.scope import EnterpriseScope
 from tools.session_search_tool import (
     _format_timestamp,
     _format_conversation,
@@ -36,6 +37,9 @@ class TestSessionSearchSchema:
         description = SESSION_SEARCH_SCHEMA["description"]
         assert "past conversations" in description
         assert "recent turns of the current session" not in description
+
+    def test_runtime_enterprise_scope_is_not_exposed_in_schema(self):
+        assert "enterprise_scope" not in SESSION_SEARCH_SCHEMA["parameters"]["properties"]
 
 
 # =========================================================================
@@ -245,6 +249,23 @@ class TestSessionSearchConcurrency:
 # =========================================================================
 
 class TestSessionSearch:
+    def test_recent_mode_passes_enterprise_scope_to_list_sessions(self):
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        scope = EnterpriseScope(tenant_id="acme", workspace_id="ops", agent_id="planner")
+        mock_db.list_sessions_rich.return_value = []
+
+        result = json.loads(session_search(query="", db=mock_db, enterprise_scope=scope))
+
+        assert result["success"] is True
+        mock_db.list_sessions_rich.assert_called_once_with(
+            limit=8,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            enterprise_scope=scope,
+        )
+
     def test_no_db_returns_error(self):
         from tools.session_search_tool import session_search
         result = json.loads(session_search(query="test"))
@@ -348,6 +369,82 @@ class TestSessionSearch:
         assert result["count"] == 0
         assert result["results"] == []
         assert result["sessions_searched"] == 0
+
+    def test_search_passes_enterprise_scope_to_db(self):
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        mock_db = MagicMock()
+        scope = EnterpriseScope(tenant_id="acme", workspace_id="ops", agent_id="planner")
+        mock_db.search_messages.return_value = []
+
+        result = json.loads(session_search(query="test", db=mock_db, enterprise_scope=scope))
+
+        assert result["success"] is True
+        mock_db.search_messages.assert_called_once_with(
+            query="test",
+            role_filter=None,
+            exclude_sources=list(_HIDDEN_SESSION_SOURCES),
+            limit=50,
+            offset=0,
+            enterprise_scope=scope,
+        )
+
+    def test_lineage_resolution_stops_at_scope_boundary(self, monkeypatch):
+        from unittest.mock import MagicMock
+        from tools.session_search_tool import session_search
+
+        scope = EnterpriseScope(tenant_id="acme", workspace_id="ops", agent_id="planner")
+        mock_db = MagicMock()
+        mock_db.search_messages.return_value = [
+            {
+                "session_id": "child-in-scope",
+                "content": "match",
+                "source": "cli",
+                "session_started": 1709500000,
+                "model": "test",
+            }
+        ]
+
+        session_rows = {
+            "child-in-scope": {
+                "id": "child-in-scope",
+                "parent_session_id": "parent-out-of-scope",
+                "tenant_id": "acme",
+                "workspace_id": "ops",
+                "agent_id": "planner",
+                "source": "cli",
+                "started_at": 1709500000,
+                "title": "child",
+            },
+            "parent-out-of-scope": {
+                "id": "parent-out-of-scope",
+                "parent_session_id": None,
+                "tenant_id": "other",
+                "workspace_id": "ops",
+                "agent_id": "planner",
+                "source": "cli",
+                "started_at": 1709400000,
+                "title": "parent",
+            },
+        }
+        mock_db.get_session.side_effect = lambda sid: session_rows.get(sid)
+        mock_db.get_messages_as_conversation.side_effect = lambda sid: [
+            {"role": "user", "content": f"message from {sid}"},
+            {"role": "assistant", "content": "response"},
+        ]
+
+        async def _fake_summarize(*_args, **_kwargs):
+            return "summary"
+
+        monkeypatch.setattr("tools.session_search_tool._summarize_session", _fake_summarize)
+        monkeypatch.setattr("model_tools._run_async", lambda coro: asyncio.run(coro))
+
+        result = json.loads(session_search(query="match", db=mock_db, enterprise_scope=scope))
+
+        assert result["success"] is True
+        assert result["results"][0]["session_id"] == "child-in-scope"
+        mock_db.get_messages_as_conversation.assert_called_once_with("child-in-scope")
 
     def test_limit_none_coerced_to_default(self):
         """Model sends limit=null → should fall back to 3, not TypeError."""
