@@ -435,6 +435,37 @@ def test_command_dispatch_returns_skill_payload(server):
     assert result["name"] == "hermes-agent-dev"
 
 
+def test_command_dispatch_hides_skill_blocked_by_scope(server, tmp_path, monkeypatch):
+    """command.dispatch should not surface a skill hidden in the current scope."""
+    sid = "test-session"
+    server._sessions[sid] = {"session_key": sid}
+
+    monkeypatch.setenv("HERMES_SCOPE_TENANT_ID", "tenant-b")
+    skill_dir = tmp_path / "skills" / "tenant-a-only"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: tenant-a-only\n"
+        "description: Hidden outside tenant-a\n"
+        "metadata:\n"
+        "  hermes:\n"
+        "    visibility:\n"
+        "      tenants: [tenant-a]\n"
+        "---\n\n"
+        "Body.\n"
+    )
+
+    with patch("tools.skills_tool.SKILLS_DIR", tmp_path / "skills"):
+        resp = server.handle_request({
+            "id": "r-hidden",
+            "method": "command.dispatch",
+            "params": {"name": "tenant-a-only", "session_id": sid},
+        })
+
+    assert "error" in resp
+    assert resp["error"]["code"] == 4018
+
+
 # ── dispatch(): pool routing for long handlers (#12546) ──────────────
 
 

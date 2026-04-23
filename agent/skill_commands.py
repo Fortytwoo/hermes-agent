@@ -7,6 +7,7 @@ can invoke skills via /skill-name commands and prompt-only built-ins like
 
 import json
 import logging
+import os
 import re
 import subprocess
 from datetime import datetime
@@ -17,7 +18,9 @@ from hermes_constants import display_hermes_home
 
 logger = logging.getLogger(__name__)
 
-_skill_commands: Dict[str, Dict[str, Any]] = {}
+_skill_commands_by_scope: Dict[
+    tuple[str, str, str, str, str], Dict[str, Dict[str, Any]]
+] = {}
 _PLAN_SLUG_RE = re.compile(r"[^a-z0-9]+")
 # Patterns for sanitizing skill names into clean hyphen-separated slugs.
 _SKILL_INVALID_CHARS = re.compile(r"[^a-z0-9-]")
@@ -147,6 +150,31 @@ def build_plan_path(
     slug = slug or "conversation-plan"
     timestamp = (now or datetime.now()).strftime("%Y-%m-%d_%H%M%S")
     return Path(".hermes") / "plans" / f"{timestamp}-{slug}.md"
+
+
+def _skill_commands_cache_key(
+    *,
+    platform: str | None = None,
+    enterprise_scope=None,
+) -> tuple[str, str, str, str, str]:
+    from agent.skill_visibility import resolve_effective_enterprise_scope
+    from gateway.session_context import get_session_env
+    from tools.skills_tool import SKILLS_DIR
+
+    scope = resolve_effective_enterprise_scope(enterprise_scope)
+    resolved_platform = (
+        platform
+        or os.getenv("HERMES_PLATFORM")
+        or get_session_env("HERMES_SESSION_PLATFORM")
+        or ""
+    )
+    return (
+        scope.tenant_id,
+        scope.workspace_id,
+        scope.agent_id,
+        resolved_platform,
+        str(SKILLS_DIR.resolve()),
+    )
 
 
 def _load_skill_payload(skill_identifier: str, task_id: str | None = None) -> tuple[dict[str, Any], Path | None, str] | None:
@@ -335,79 +363,81 @@ def _build_skill_message(
     return "\n".join(parts)
 
 
-def scan_skill_commands() -> Dict[str, Dict[str, Any]]:
+def scan_skill_commands(
+    *,
+    platform: str | None = None,
+    enterprise_scope=None,
+) -> Dict[str, Dict[str, Any]]:
     """Scan ~/.hermes/skills/ and return a mapping of /command -> skill info.
 
     Returns:
         Dict mapping "/skill-name" to {name, description, skill_md_path, skill_dir}.
     """
-    global _skill_commands
-    _skill_commands = {}
+    from agent.skill_registry import iter_local_skill_records
+    from agent.skill_visibility import (
+        resolve_effective_enterprise_scope,
+        skill_view_visible_to_scope,
+    )
+    from tools.skills_tool import SKILLS_DIR
+
+    cache_key = _skill_commands_cache_key(
+        platform=platform,
+        enterprise_scope=enterprise_scope,
+    )
+    skill_commands: Dict[str, Dict[str, Any]] = {}
     try:
-        from tools.skills_tool import SKILLS_DIR, _parse_frontmatter, skill_matches_platform, _get_disabled_skill_names
-        from agent.skill_utils import get_external_skills_dirs
-        disabled = _get_disabled_skill_names()
-        seen_names: set = set()
+        resolved_scope = resolve_effective_enterprise_scope(enterprise_scope)
+        for record in iter_local_skill_records(SKILLS_DIR, platform=platform):
+            if not skill_view_visible_to_scope(
+                resolved_scope,
+                {
+                    "name": record.identifier,
+                    "frontmatter": record.frontmatter,
+                    "visibility_policy": record.visibility_policy,
+                },
+            ):
+                continue
 
-        # Scan local dir first, then external dirs
-        dirs_to_scan = []
-        if SKILLS_DIR.exists():
-            dirs_to_scan.append(SKILLS_DIR)
-        dirs_to_scan.extend(get_external_skills_dirs())
-
-        for scan_dir in dirs_to_scan:
-            for skill_md in scan_dir.rglob("SKILL.md"):
-                if any(part in ('.git', '.github', '.hub') for part in skill_md.parts):
-                    continue
-                try:
-                    content = skill_md.read_text(encoding='utf-8')
-                    frontmatter, body = _parse_frontmatter(content)
-                    # Skip skills incompatible with the current OS platform
-                    if not skill_matches_platform(frontmatter):
-                        continue
-                    name = frontmatter.get('name', skill_md.parent.name)
-                    if name in seen_names:
-                        continue
-                    # Respect user's disabled skills config
-                    if name in disabled:
-                        continue
-                    description = frontmatter.get('description', '')
-                    if not description:
-                        for line in body.strip().split('\n'):
-                            line = line.strip()
-                            if line and not line.startswith('#'):
-                                description = line[:80]
-                                break
-                    seen_names.add(name)
-                    # Normalize to hyphen-separated slug, stripping
-                    # non-alnum chars (e.g. +, /) to avoid invalid
-                    # Telegram command names downstream.
-                    cmd_name = name.lower().replace(' ', '-').replace('_', '-')
-                    cmd_name = _SKILL_INVALID_CHARS.sub('', cmd_name)
-                    cmd_name = _SKILL_MULTI_HYPHEN.sub('-', cmd_name).strip('-')
-                    if not cmd_name:
-                        continue
-                    _skill_commands[f"/{cmd_name}"] = {
-                        "name": name,
-                        "description": description or f"Invoke the {name} skill",
-                        "skill_md_path": str(skill_md),
-                        "skill_dir": str(skill_md.parent),
-                    }
-                except Exception:
-                    continue
+            name = record.name
+            description = record.description or f"Invoke the {name} skill"
+            cmd_name = name.lower().replace(" ", "-").replace("_", "-")
+            cmd_name = _SKILL_INVALID_CHARS.sub("", cmd_name)
+            cmd_name = _SKILL_MULTI_HYPHEN.sub("-", cmd_name).strip("-")
+            if not cmd_name:
+                continue
+            skill_commands[f"/{cmd_name}"] = {
+                "name": name,
+                "description": description,
+                "skill_md_path": str(record.skill_md_path),
+                "skill_dir": str(record.skill_dir) if record.skill_dir else "",
+            }
     except Exception:
         pass
-    return _skill_commands
+    _skill_commands_by_scope[cache_key] = skill_commands
+    return skill_commands
 
 
-def get_skill_commands() -> Dict[str, Dict[str, Any]]:
+def get_skill_commands(
+    *,
+    platform: str | None = None,
+    enterprise_scope=None,
+) -> Dict[str, Dict[str, Any]]:
     """Return the current skill commands mapping (scan first if empty)."""
-    if not _skill_commands:
-        scan_skill_commands()
-    return _skill_commands
+    cache_key = _skill_commands_cache_key(
+        platform=platform,
+        enterprise_scope=enterprise_scope,
+    )
+    if cache_key not in _skill_commands_by_scope:
+        scan_skill_commands(platform=platform, enterprise_scope=enterprise_scope)
+    return _skill_commands_by_scope.get(cache_key, {})
 
 
-def resolve_skill_command_key(command: str) -> Optional[str]:
+def resolve_skill_command_key(
+    command: str,
+    *,
+    platform: str | None = None,
+    enterprise_scope=None,
+) -> Optional[str]:
     """Resolve a user-typed /command to its canonical skill_cmds key.
 
     Skills are always stored with hyphens — ``scan_skill_commands`` normalizes
@@ -423,7 +453,14 @@ def resolve_skill_command_key(command: str) -> Optional[str]:
     if not command:
         return None
     cmd_key = f"/{command.replace('_', '-')}"
-    return cmd_key if cmd_key in get_skill_commands() else None
+    return (
+        cmd_key
+        if cmd_key in get_skill_commands(
+            platform=platform,
+            enterprise_scope=enterprise_scope,
+        )
+        else None
+    )
 
 
 def build_skill_invocation_message(
@@ -431,6 +468,9 @@ def build_skill_invocation_message(
     user_instruction: str = "",
     task_id: str | None = None,
     runtime_note: str = "",
+    *,
+    platform: str | None = None,
+    enterprise_scope=None,
 ) -> Optional[str]:
     """Build the user message content for a skill slash command invocation.
 
@@ -441,7 +481,10 @@ def build_skill_invocation_message(
     Returns:
         The formatted message string, or None if the skill wasn't found.
     """
-    commands = get_skill_commands()
+    commands = get_skill_commands(
+        platform=platform,
+        enterprise_scope=enterprise_scope,
+    )
     skill_info = commands.get(cmd_key)
     if not skill_info:
         return None

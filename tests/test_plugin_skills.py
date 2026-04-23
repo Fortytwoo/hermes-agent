@@ -311,6 +311,26 @@ class TestSkillViewPluginGuards:
         assert "Ignore previous instructions" in result["content"]
         assert any("injection" in r.message.lower() for r in caplog.records)
 
+    def test_scope_visibility_blocks_plugin_skill(self, tmp_path, monkeypatch):
+        from tools.skills_tool import skill_view
+
+        self._reg(
+            tmp_path,
+            "---\n"
+            "name: foo\n"
+            "metadata:\n"
+            "  hermes:\n"
+            "    visibility:\n"
+            "      tenants: [tenant-a]\n"
+            "---\n"
+            "Body.\n",
+        )
+        monkeypatch.setenv("HERMES_SCOPE_TENANT_ID", "tenant-b")
+
+        result = json.loads(skill_view("myplugin:foo"))
+        assert result["success"] is False
+        assert "not visible in this scope" in result["error"].lower()
+
 
 class TestBundleContextBanner:
     @pytest.fixture(autouse=True)

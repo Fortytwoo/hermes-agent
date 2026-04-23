@@ -554,68 +554,40 @@ def _find_all_skills(*, skip_disabled: bool = False) -> List[Dict[str, Any]]:
     Returns:
         List of skill metadata dicts (name, description, category).
     """
-    from agent.skill_utils import get_external_skills_dirs
+    from agent.skill_registry import iter_local_skill_records
+    from agent.skill_visibility import (
+        resolve_effective_enterprise_scope,
+        skill_list_visible_to_scope,
+    )
 
     skills = []
-    seen_names: set = set()
+    enterprise_scope = resolve_effective_enterprise_scope()
 
-    # Load disabled set once (not per-skill)
-    disabled = set() if skip_disabled else _get_disabled_skill_names()
+    for record in iter_local_skill_records(
+        SKILLS_DIR,
+        skip_disabled=skip_disabled,
+    ):
+        if not skill_list_visible_to_scope(
+            enterprise_scope,
+            {
+                "name": record.name,
+                "frontmatter": record.frontmatter,
+                "visibility_policy": record.visibility_policy,
+            },
+        ):
+            continue
 
-    # Scan local dir first, then external dirs (local takes precedence)
-    dirs_to_scan = []
-    if SKILLS_DIR.exists():
-        dirs_to_scan.append(SKILLS_DIR)
-    dirs_to_scan.extend(get_external_skills_dirs())
+        description = record.description
+        if len(description) > MAX_DESCRIPTION_LENGTH:
+            description = description[:MAX_DESCRIPTION_LENGTH - 3] + "..."
 
-    for scan_dir in dirs_to_scan:
-        for skill_md in scan_dir.rglob("SKILL.md"):
-            if any(part in _EXCLUDED_SKILL_DIRS for part in skill_md.parts):
-                continue
-
-            skill_dir = skill_md.parent
-
-            try:
-                content = skill_md.read_text(encoding="utf-8")[:4000]
-                frontmatter, body = _parse_frontmatter(content)
-
-                if not skill_matches_platform(frontmatter):
-                    continue
-
-                name = frontmatter.get("name", skill_dir.name)[:MAX_NAME_LENGTH]
-                if name in seen_names:
-                    continue
-                if name in disabled:
-                    continue
-
-                description = frontmatter.get("description", "")
-                if not description:
-                    for line in body.strip().split("\n"):
-                        line = line.strip()
-                        if line and not line.startswith("#"):
-                            description = line
-                            break
-
-                if len(description) > MAX_DESCRIPTION_LENGTH:
-                    description = description[:MAX_DESCRIPTION_LENGTH - 3] + "..."
-
-                category = _get_category_from_path(skill_md)
-
-                seen_names.add(name)
-                skills.append({
-                    "name": name,
-                    "description": description,
-                    "category": category,
-                })
-
-            except (UnicodeDecodeError, PermissionError) as e:
-                logger.debug("Failed to read skill file %s: %s", skill_md, e)
-                continue
-            except Exception as e:
-                logger.debug(
-                    "Skipping skill at %s: failed to parse: %s", skill_md, e, exc_info=True
-                )
-                continue
+        skills.append(
+            {
+                "name": record.name[:MAX_NAME_LENGTH],
+                "description": description,
+                "category": record.category,
+            }
+        )
 
     return skills
 
@@ -738,9 +710,13 @@ def _serve_plugin_skill(
     skill_md: Path,
     namespace: str,
     bare: str,
+    *,
+    enterprise_scope=None,
 ) -> str:
     """Read a plugin-provided skill, apply guards, return JSON."""
     from hermes_cli.plugins import _get_disabled_plugins, get_plugin_manager
+    from agent.skill_registry import build_plugin_skill_record
+    from agent.skill_visibility import skill_view_visible_to_scope
 
     if namespace in _get_disabled_plugins():
         return json.dumps(
@@ -789,6 +765,27 @@ def _serve_plugin_skill(
     if len(description) > MAX_DESCRIPTION_LENGTH:
         description = description[: MAX_DESCRIPTION_LENGTH - 3] + "..."
 
+    record = build_plugin_skill_record(
+        namespace=namespace,
+        bare_name=bare,
+        skill_md_path=skill_md,
+    )
+    if not skill_view_visible_to_scope(
+        enterprise_scope,
+        {
+            "name": record.identifier,
+            "frontmatter": record.frontmatter,
+            "visibility_policy": record.visibility_policy,
+        },
+    ):
+        return json.dumps(
+            {
+                "success": False,
+                "error": f"Skill '{record.identifier}' is not visible in this scope.",
+            },
+            ensure_ascii=False,
+        )
+
     # Bundle context banner — tells the agent about sibling skills
     try:
         siblings = [
@@ -810,7 +807,7 @@ def _serve_plugin_skill(
     return json.dumps(
         {
             "success": True,
-            "name": f"{namespace}:{bare}",
+            "name": record.identifier,
             "content": f"{banner}{content}" if banner else content,
             "description": description,
             "linked_files": None,
@@ -834,6 +831,14 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
         JSON string with skill content or error message
     """
     try:
+        from agent.skill_registry import find_local_skill_record
+        from agent.skill_visibility import (
+            resolve_effective_enterprise_scope,
+            skill_view_visible_to_scope,
+        )
+
+        enterprise_scope = resolve_effective_enterprise_scope()
+
         # ── Qualified name dispatch (plugin skills) ──────────────────
         # Names containing ':' are routed to the plugin skill registry.
         # Bare names fall through to the existing flat-tree scan below.
@@ -874,7 +879,12 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
                         },
                         ensure_ascii=False,
                     )
-                return _serve_plugin_skill(plugin_skill_md, namespace, bare)
+                return _serve_plugin_skill(
+                    plugin_skill_md,
+                    namespace,
+                    bare,
+                    enterprise_scope=enterprise_scope,
+                )
 
             # Plugin exists but this specific skill is missing?
             available = pm.list_plugin_skills(namespace)
@@ -908,41 +918,18 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
                 ensure_ascii=False,
             )
 
-        skill_dir = None
-        skill_md = None
-
-        # Search all dirs: local first, then external (first match wins)
-        for search_dir in all_dirs:
-            # Try direct path first (e.g., "mlops/axolotl")
-            direct_path = search_dir / name
-            if direct_path.is_dir() and (direct_path / "SKILL.md").exists():
-                skill_dir = direct_path
-                skill_md = direct_path / "SKILL.md"
-                break
-            elif direct_path.with_suffix(".md").exists():
-                skill_md = direct_path.with_suffix(".md")
-                break
-
-        # Search by directory name across all dirs
-        if not skill_md:
-            for search_dir in all_dirs:
-                for found_skill_md in search_dir.rglob("SKILL.md"):
-                    if found_skill_md.parent.name == name:
-                        skill_dir = found_skill_md.parent
-                        skill_md = found_skill_md
-                        break
-                if skill_md:
-                    break
-
-        # Legacy: flat .md files
-        if not skill_md:
-            for search_dir in all_dirs:
-                for found_md in search_dir.rglob(f"{name}.md"):
-                    if found_md.name != "SKILL.md":
-                        skill_md = found_md
-                        break
-                if skill_md:
-                    break
+        try:
+            record = find_local_skill_record(SKILLS_DIR, name)
+        except Exception as e:
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Failed to read skill '{name}': {e}",
+                },
+                ensure_ascii=False,
+            )
+        skill_dir = record.skill_dir if record else None
+        skill_md = record.skill_md_path if record else None
 
         if not skill_md or not skill_md.exists():
             available = [s["name"] for s in _find_all_skills()[:20]]
@@ -952,6 +939,22 @@ def skill_view(name: str, file_path: str = None, task_id: str = None) -> str:
                     "error": f"Skill '{name}' not found.",
                     "available_skills": available,
                     "hint": "Use skills_list to see all available skills",
+                },
+                ensure_ascii=False,
+            )
+
+        if not skill_view_visible_to_scope(
+            enterprise_scope,
+            {
+                "name": record.identifier if record else name,
+                "frontmatter": record.frontmatter if record else {},
+                "visibility_policy": record.visibility_policy if record else {},
+            },
+        ):
+            return json.dumps(
+                {
+                    "success": False,
+                    "error": f"Skill '{record.identifier if record else name}' is not visible in this scope.",
                 },
                 ensure_ascii=False,
             )

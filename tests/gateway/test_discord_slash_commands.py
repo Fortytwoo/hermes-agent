@@ -736,6 +736,32 @@ def test_register_skill_command_empty_skills_no_command(adapter):
     assert "skill" not in tree.commands
 
 
+def test_register_skill_command_skips_scope_hidden_skills(adapter, tmp_path, monkeypatch):
+    """Scope-hidden skills should not produce a Discord /skill command entry."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setenv("HERMES_SCOPE_TENANT_ID", "tenant-b")
+
+    skill_dir = tmp_path / "skills" / "tenant-a-only"
+    skill_dir.mkdir(parents=True, exist_ok=True)
+    (skill_dir / "SKILL.md").write_text(
+        "---\n"
+        "name: tenant-a-only\n"
+        "description: Hidden outside tenant-a\n"
+        "metadata:\n"
+        "  hermes:\n"
+        "    visibility:\n"
+        "      tenants: [tenant-a]\n"
+        "---\n\n"
+        "Body.\n"
+    )
+
+    with patch("tools.skills_tool.SKILLS_DIR", tmp_path / "skills"):
+        adapter._register_slash_commands()
+
+    tree = adapter._client.tree
+    assert "skill" not in tree.commands
+
+
 def test_register_skill_command_callback_dispatches_by_name(adapter):
     """The /skill callback should look up the skill by ``name`` and
     dispatch via ``_run_simple_slash`` with the real command key.
