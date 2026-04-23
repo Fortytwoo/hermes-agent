@@ -17,9 +17,9 @@
 | PR | Theme | Status | Notes |
 |---|---|---|---|
 | PR1 | Scope Foundation | In code + verified | Scope/address foundation landed in current worktree; A/B functional testing completed |
-| PR2 | Scoped Session Search | Pending | Planned only |
-| PR3 | Scoped Memory | Pending | Planned only |
-| PR4 | Scoped Skills Visibility | Pending | Planned only |
+| PR2 | Scoped Session Search | In code + verified | Local implementation complete; targeted + broad Functional Testing green after baseline test-stability fix |
+| PR3 | Scoped Memory | In progress | Rebased onto PR2 baseline; implementation underway |
+| PR4 | Scoped Skills Visibility | In code + verified | Local implementation complete; all entrypoint visibility tests and broad Functional Testing green |
 | PR5 | Tool Policy and Context Pack | Deferred | Depends on PR1-PR4 being stable |
 | PR6 | Run Queue and Session Actor | Deferred | Depends on earlier rollout proving stable |
 
@@ -129,6 +129,15 @@
 - No scope is derived from parsing `session_key` at tool level
 - Compression guidance and lineage traversal stay intra-scope
 
+**Current execution evidence**
+- Local branch: `codex/pr2-scoped-session-search`
+- Commits:
+  - `8110f226` `test: isolate mcp oauth prefetch regressions`
+  - `61e5125e` `feat: scope session search to enterprise context`
+- Verification:
+  - targeted regression: `567 passed`
+  - broad Functional Testing wave: `3894 passed, 27 skipped`
+
 ---
 
 ## PR3 - Scoped Memory
@@ -235,6 +244,16 @@
 - No scope inference is derived from `session_key`
 - Every user-facing skill entrypoint returns the same visibility result for the same scope
 
+**Current execution evidence**
+- Local branch: `codex/pr4-scoped-skills-visibility`
+- Commits:
+  - `8110f226` `test: isolate mcp oauth prefetch regressions`
+  - `0ae2556d` `feat: scope skill visibility across entrypoints`
+- Verification:
+  - targeted skill visibility suites: `114 passed`
+  - entrypoint consistency suites: `218 passed`
+  - broad Functional Testing wave: `3970 passed, 25 skipped`
+
 ---
 
 ## PR5 - Deferred Tool Policy and Context Pack
@@ -340,3 +359,4 @@
 - PR2 and PR4 are the first parallel delivery wave from the frozen PR1 baseline.
 - PR3 should start from the same sibling baseline but must rebase before final verification because it overlaps PR2 in `run_agent.py`.
 - PR5 and PR6 should not start until PR2-PR4 are stable and reviewed.
+- Baseline stabilization note: `29e16eb1` isolates MCP OAuth prefetch in four regression tests so Linux/CI broad Functional Testing does not stall on real discovery traffic.
