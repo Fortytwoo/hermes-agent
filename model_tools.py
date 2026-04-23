@@ -26,6 +26,7 @@ import logging
 import threading
 from typing import Dict, Any, List, Optional, Tuple
 
+from agent.tool_policy import ToolPolicy
 from tools.registry import discover_builtin_tools, registry
 from toolsets import resolve_toolset, validate_toolset
 
@@ -197,6 +198,7 @@ def get_tool_definitions(
     enabled_toolsets: List[str] = None,
     disabled_toolsets: List[str] = None,
     quiet_mode: bool = False,
+    tool_policy: Optional[ToolPolicy] = None,
 ) -> List[Dict[str, Any]]:
     """
     Get tool definitions for model API calls with toolset-based filtering.
@@ -207,6 +209,7 @@ def get_tool_definitions(
         enabled_toolsets: Only include tools from these toolsets.
         disabled_toolsets: Exclude tools from these toolsets (if enabled_toolsets is None).
         quiet_mode: Suppress status prints.
+        tool_policy: Optional runtime visibility policy.
 
     Returns:
         Filtered list of OpenAI-format tool definitions.
@@ -262,6 +265,15 @@ def get_tool_definitions(
 
     # Ask the registry for schemas (only returns tools whose check_fn passes)
     filtered_tools = registry.get_definitions(tools_to_include, quiet=quiet_mode)
+
+    if tool_policy is not None:
+        visible_tool_names = tool_policy.filter_visible(
+            tool["function"]["name"] for tool in filtered_tools
+        )
+        filtered_tools = [
+            tool for tool in filtered_tools
+            if tool["function"]["name"] in visible_tool_names
+        ]
 
     # The set of tool names that actually passed check_fn filtering.
     # Use this (not tools_to_include) for any downstream schema that references

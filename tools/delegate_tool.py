@@ -623,6 +623,7 @@ def _build_child_agent(
         providers_ignored=parent_agent.providers_ignored,
         providers_order=parent_agent.providers_order,
         provider_sort=parent_agent.provider_sort,
+        tool_policy=getattr(parent_agent, "tool_policy", None),
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent
     )

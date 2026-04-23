@@ -4,8 +4,11 @@ import json
 import pytest
 from typing import Any, Dict, List
 
+from agent.context_pack import ContextPack
 from agent.context_engine import ContextEngine
 from agent.context_compressor import ContextCompressor
+from agent.enterprise_context_engine import EnterpriseContextEngine
+from agent.scope import EnterpriseScope, SessionAddress
 
 
 # ---------------------------------------------------------------------------
@@ -123,6 +126,14 @@ class TestDefaults:
     def test_should_compress_preflight_default_false(self):
         engine = StubEngine()
         assert engine.should_compress_preflight([]) is False
+
+    def test_default_context_pack_is_none(self):
+        engine = StubEngine()
+        assert ContextEngine.build_context_pack(engine, runtime_metadata=None) is None
+
+    def test_default_tool_policy_is_none(self):
+        engine = StubEngine()
+        assert ContextEngine.resolve_tool_policy(engine, runtime_metadata=None) is None
 
 
 # ---------------------------------------------------------------------------
@@ -248,3 +259,43 @@ class TestPluginContextEngineSlot:
             assert get_plugin_context_engine() is engine
         finally:
             plugins_mod._plugin_manager = old_mgr
+
+
+# ---------------------------------------------------------------------------
+# Enterprise context engine
+# ---------------------------------------------------------------------------
+
+class TestEnterpriseContextEngine:
+    def test_build_context_pack_returns_typed_runtime_object(self):
+        engine = EnterpriseContextEngine()
+
+        pack = engine.build_context_pack(
+            enterprise_scope=EnterpriseScope(
+                tenant_id="tenant-1",
+                workspace_id="workspace-9",
+                agent_id="planner",
+            ),
+            session_address=SessionAddress(
+                platform="slack",
+                chat_type="channel",
+                chat_id="C123",
+                thread_id="T456",
+            ),
+            user_id="user-7",
+            platform="slack",
+            session_id="session-1",
+        )
+
+        assert isinstance(pack, ContextPack)
+        assert pack.runtime.enterprise_scope.tenant_id == "tenant-1"
+        assert pack.runtime.session_address.platform == "slack"
+        assert pack.runtime.user_id == "user-7"
+        rendered = pack.render()
+        assert "tenant-1" in rendered
+        assert "workspace-9" in rendered
+        assert "user-7" in rendered
+        assert "slack" in rendered
+
+    def test_resolve_tool_policy_defaults_to_none_when_unconfigured(self):
+        engine = EnterpriseContextEngine()
+        assert engine.resolve_tool_policy(user_id="user-7") is None
