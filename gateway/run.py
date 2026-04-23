@@ -31,6 +31,7 @@ from datetime import datetime
 from typing import Dict, Optional, Any, List
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
+from agent.memory_backend import MemoryBackend
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -904,6 +905,12 @@ class GatewayRunner:
                 return
 
             from run_agent import AIAgent
+            parsed_scope = parse_scoped_session_key(session_key) if session_key else None
+            if parsed_scope is not None:
+                enterprise_scope, session_address = parsed_scope
+            else:
+                enterprise_scope, session_address = None, None
+            scoped_user_id = getattr(session_address, "user_id", "") if session_address else ""
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 session_key=session_key,
             )
@@ -918,6 +925,9 @@ class GatewayRunner:
                 skip_memory=True,  # Flush agent — no memory provider
                 enabled_toolsets=["memory", "skills"],
                 session_id=old_session_id,
+                user_id=scoped_user_id,
+                enterprise_scope=enterprise_scope,
+                session_address=session_address,
             )
             try:
                 # Fully silence the flush agent — quiet_mode only suppresses init
@@ -936,13 +946,17 @@ class GatewayRunner:
                 # what's already saved and avoid overwriting newer entries.
                 _current_memory = ""
                 try:
-                    from tools.memory_tool import get_memory_dir
-                    _mem_dir = get_memory_dir()
+                    _backend = MemoryBackend(get_hermes_home() / "memories")
                     for fname, label in [
                         ("MEMORY.md", "MEMORY (your personal notes)"),
                         ("USER.md", "USER PROFILE (who the user is)"),
                     ]:
-                        fpath = _mem_dir / fname
+                        target = "user" if fname == "USER.md" else "memory"
+                        fpath = _backend.path_for(
+                            target,
+                            scope=enterprise_scope,
+                            user_id=scoped_user_id,
+                        )
                         if fpath.exists():
                             content = fpath.read_text(encoding="utf-8").strip()
                             if content:

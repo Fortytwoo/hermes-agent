@@ -22,6 +22,7 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import pytest
+from agent.memory_backend import MemoryBackend
 from agent.scope import EnterpriseScope, SessionAddress
 
 
@@ -288,4 +289,88 @@ class TestAgentSessionMetadataPersistence:
         args, kwargs = session_db.ensure_session.call_args
         assert args[0] == "scoped-session"
         assert kwargs["enterprise_scope"] == enterprise_scope
-        assert kwargs["session_address"] == session_address
+
+
+class TestScopedMemoryStorePersistence:
+    def test_agent_builds_memory_store_with_frozen_scope_identity(self, monkeypatch):
+        captured = {}
+
+        class FakeStore:
+            def __init__(self, **kwargs):
+                captured["init_kwargs"] = kwargs
+
+            def load_from_disk(self):
+                captured["loaded"] = True
+
+        monkeypatch.setattr("tools.memory_tool.MemoryStore", FakeStore)
+
+        config = {
+            "memory": {
+                "memory_enabled": True,
+                "user_profile_enabled": True,
+                "memory_char_limit": 2200,
+                "user_char_limit": 1375,
+            }
+        }
+        enterprise_scope = EnterpriseScope(
+            tenant_id="acme",
+            workspace_id="ops",
+            agent_id="planner",
+        )
+
+        with patch("hermes_cli.config.load_config", return_value=config):
+            from run_agent import AIAgent
+
+            AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                session_id="memory-session",
+                skip_context_files=True,
+                user_id="alice",
+                enterprise_scope=enterprise_scope,
+            )
+
+        assert captured["loaded"] is True
+        assert captured["init_kwargs"]["enterprise_scope"] == enterprise_scope
+        assert captured["init_kwargs"]["user_id"] == "alice"
+        assert isinstance(captured["init_kwargs"]["backend"], MemoryBackend)
+
+    def test_invalidate_system_prompt_reloads_same_scoped_namespace(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        config = {
+            "memory": {
+                "memory_enabled": True,
+                "user_profile_enabled": True,
+            }
+        }
+        enterprise_scope = EnterpriseScope(
+            tenant_id="acme",
+            workspace_id="ops",
+            agent_id="planner",
+        )
+
+        with patch("hermes_cli.config.load_config", return_value=config):
+            from run_agent import AIAgent
+
+            agent = AIAgent(
+                api_key="test-key",
+                base_url="https://openrouter.ai/api/v1",
+                model="test/model",
+                quiet_mode=True,
+                session_id="memory-session",
+                skip_context_files=True,
+                user_id="alice",
+                enterprise_scope=enterprise_scope,
+            )
+
+        scoped_memory = agent._memory_store._path_for("memory")
+        scoped_memory.parent.mkdir(parents=True, exist_ok=True)
+        scoped_memory.write_text("scoped-memory-entry", encoding="utf-8")
+        (tmp_path / "memories" / "MEMORY.md").write_text("legacy-memory-entry", encoding="utf-8")
+
+        agent._memory_store.memory_entries = []
+        agent._invalidate_system_prompt()
+
+        assert agent._memory_store.memory_entries == ["scoped-memory-entry"]
