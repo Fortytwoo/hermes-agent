@@ -3545,6 +3545,7 @@ class GatewayRunner:
                     "/plan",
                     user_instruction,
                     task_id=_quick_key,
+                    platform=source.platform.value if source.platform else None,
                     runtime_note=(
                         "Save the markdown plan with write_file to this exact relative path "
                         f"inside the active workspace/backend cwd: {plan_path}"
@@ -3699,13 +3700,13 @@ class GatewayRunner:
                     build_skill_invocation_message,
                     resolve_skill_command_key,
                 )
-                skill_cmds = get_skill_commands()
-                cmd_key = resolve_skill_command_key(command)
+                _platform_name = source.platform.value if source.platform else None
+                skill_cmds = get_skill_commands(platform=_platform_name)
+                cmd_key = resolve_skill_command_key(command, platform=_platform_name)
                 if cmd_key is not None:
-                    # Check per-platform disabled status before executing.
-                    # get_skill_commands() only applies the *global* disabled
-                    # list at scan time; per-platform overrides need checking
-                    # here because the cache is process-global across platforms.
+                    # Re-check platform-specific disabled status at dispatch
+                    # time so direct command execution stays aligned with the
+                    # current gateway surface.
                     _skill_name = skill_cmds[cmd_key].get("name", "")
                     _plat = source.platform.value if source.platform else None
                     if _plat and _skill_name:
@@ -3717,7 +3718,10 @@ class GatewayRunner:
                             )
                     user_instruction = event.get_command_args().strip()
                     msg = build_skill_invocation_message(
-                        cmd_key, user_instruction, task_id=_quick_key
+                        cmd_key,
+                        user_instruction,
+                        task_id=_quick_key,
+                        platform=_platform_name,
                     )
                     if msg:
                         event.text = msg
@@ -5282,7 +5286,9 @@ class GatewayRunner:
         ]
         try:
             from agent.skill_commands import get_skill_commands
-            skill_cmds = get_skill_commands()
+            skill_cmds = get_skill_commands(
+                platform=event.source.platform.value if event.source.platform else None
+            )
             if skill_cmds:
                 lines.append(f"\n⚡ **Skill Commands** ({len(skill_cmds)} active):")
                 # Show first 10, then point to /commands for the rest
@@ -5312,7 +5318,9 @@ class GatewayRunner:
         entries = list(gateway_help_lines())
         try:
             from agent.skill_commands import get_skill_commands
-            skill_cmds = get_skill_commands()
+            skill_cmds = get_skill_commands(
+                platform=event.source.platform.value if event.source.platform else None
+            )
             if skill_cmds:
                 entries.append("")
                 entries.append("⚡ **Skill Commands**:")

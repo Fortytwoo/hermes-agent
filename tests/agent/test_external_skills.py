@@ -155,3 +155,39 @@ class TestExternalSkillView:
             result = json.loads(skill_view("my-external-skill"))
         assert result["success"] is True
         assert "external things" in result["content"]
+
+    def test_skill_view_blocks_external_skill_hidden_by_scope(
+        self, hermes_home, external_skills_dir
+    ):
+        skill_md = external_skills_dir / "my-external-skill" / "SKILL.md"
+        skill_md.write_text(
+            "---\n"
+            "name: my-external-skill\n"
+            "description: A skill from an external directory\n"
+            "metadata:\n"
+            "  hermes:\n"
+            "    visibility:\n"
+            "      tenants: [tenant-a]\n"
+            "---\n\n"
+            "# My External Skill\n\n"
+            "Do external things.\n"
+        )
+        (hermes_home / "config.yaml").write_text(
+            f"skills:\n  external_dirs:\n    - {external_skills_dir}\n"
+        )
+        local_skills = hermes_home / "skills"
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "HERMES_HOME": str(hermes_home),
+                    "HERMES_SCOPE_TENANT_ID": "tenant-b",
+                },
+            ),
+            patch("tools.skills_tool.SKILLS_DIR", local_skills),
+        ):
+            from tools.skills_tool import skill_view
+
+            result = json.loads(skill_view("my-external-skill"))
+        assert result["success"] is False
+        assert "not visible in this scope" in result["error"].lower()
