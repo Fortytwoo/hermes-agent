@@ -17,6 +17,8 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
+<<<<<<< HEAD
+from agent.tool_policy import ToolPolicy
 from agent.scope import EnterpriseScope, SessionAddress
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
@@ -70,6 +72,7 @@ def _make_mock_parent(depth=0):
     parent._print_fn = None
     parent.tool_progress_callback = None
     parent.thinking_callback = None
+    parent.tool_policy = None
     return parent
 
 
@@ -339,6 +342,30 @@ class TestDelegateTask(unittest.TestCase):
         self.assertTrue(callable(mock_child.thinking_callback))
         mock_child.thinking_callback("deliberating...")
         parent.tool_progress_callback.assert_not_called()
+
+    def test_child_inherits_parent_tool_policy(self):
+        parent = _make_mock_parent(depth=0)
+        parent.tool_policy = ToolPolicy(
+            visible_tool_names={"read_file", "write_file"},
+            authorized_tool_names={"read_file"},
+        )
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                goal="Keep tool auth boundary",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertIs(MockAgent.call_args[1]["tool_policy"], parent.tool_policy)
 
 
 class TestToolNamePreservation(unittest.TestCase):

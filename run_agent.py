@@ -101,9 +101,12 @@ from agent.model_metadata import (
     query_ollama_num_ctx,
 )
 from agent.context_compressor import ContextCompressor
+from agent.context_pack import ContextPack
+from agent.enterprise_context_engine import EnterpriseContextEngine
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
+from agent.tool_policy import ToolPolicy
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.codex_responses_adapter import (
     _chat_content_to_responses_parts,
@@ -759,6 +762,7 @@ class AIAgent:
         gateway_session_key: str = None,
         enterprise_scope: Optional[EnterpriseScope] = None,
         session_address: Optional[SessionAddress] = None,
+        tool_policy: Optional[ToolPolicy] = None,
         skip_context_files: bool = False,
         skip_memory: bool = False,
         session_db=None,
@@ -830,6 +834,17 @@ class AIAgent:
         self._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
         self.enterprise_scope = enterprise_scope or EnterpriseScope()
         self.session_address = session_address or SessionAddress()
+        self.tool_policy = tool_policy
+        self.context_pack: Optional[ContextPack] = None
+        _enterprise_runtime_engine = EnterpriseContextEngine()
+        if self.tool_policy is None:
+            self.tool_policy = _enterprise_runtime_engine.resolve_tool_policy(
+                enterprise_scope=self.enterprise_scope,
+                session_address=self.session_address,
+                user_id=self._user_id or "",
+                platform=self.platform or "",
+                session_id=session_id or "",
+            )
         # Pluggable print function — CLI replaces this with _cprint so that
         # raw ANSI status lines are routed through prompt_toolkit's renderer
         # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -1302,6 +1317,7 @@ class AIAgent:
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
             quiet_mode=self.quiet_mode,
+            tool_policy=self.tool_policy,
         )
         
         # Show tool configuration and store valid tool names for validation
@@ -1319,6 +1335,10 @@ class AIAgent:
                     print(f"   ❌ Disabled toolsets: {', '.join(disabled_toolsets)}")
         elif not self.quiet_mode:
             print("🛠️  No tools loaded (all tools filtered out or unavailable)")
+        self.authorized_tool_names = (
+            self.tool_policy.filter_authorized(self.valid_tool_names)
+            if self.tool_policy else set(self.valid_tool_names)
+        )
         
         # Check tool requirements
         if self.tools and not self.quiet_mode:
@@ -1356,6 +1376,13 @@ class AIAgent:
             timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
             short_uuid = uuid.uuid4().hex[:6]
             self.session_id = f"{timestamp_str}_{short_uuid}"
+        self.context_pack = _enterprise_runtime_engine.build_context_pack(
+            enterprise_scope=self.enterprise_scope,
+            session_address=self.session_address,
+            user_id=self._user_id or "",
+            platform=self.platform or "",
+            session_id=self.session_id,
+        )
         
         # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
         hermes_home = get_hermes_home()
@@ -1728,13 +1755,32 @@ class AIAgent:
         # Inject context engine tool schemas (e.g. lcm_grep, lcm_describe, lcm_expand)
         self._context_engine_tool_names: set = set()
         if hasattr(self, "context_compressor") and self.context_compressor and self.tools is not None:
-            for _schema in self.context_compressor.get_tool_schemas():
+            _context_engine_schemas = list(self.context_compressor.get_tool_schemas())
+            _visible_context_engine_tool_names = (
+                self.tool_policy.filter_visible(
+                    _schema.get("name", "")
+                    for _schema in _context_engine_schemas
+                    if _schema.get("name")
+                )
+                if self.tool_policy else None
+            )
+            for _schema in _context_engine_schemas:
                 _wrapped = {"type": "function", "function": _schema}
-                self.tools.append(_wrapped)
                 _tname = _schema.get("name", "")
+                if (
+                    _visible_context_engine_tool_names is not None
+                    and _tname
+                    and _tname not in _visible_context_engine_tool_names
+                ):
+                    continue
+                self.tools.append(_wrapped)
                 if _tname:
                     self.valid_tool_names.add(_tname)
                     self._context_engine_tool_names.add(_tname)
+        self.authorized_tool_names = (
+            self.tool_policy.filter_authorized(self.valid_tool_names)
+            if self.tool_policy else set(self.valid_tool_names)
+        )
 
         # Notify context engine of session start
         if hasattr(self, "context_compressor") and self.context_compressor:
@@ -7708,6 +7754,14 @@ class AIAgent:
             pass
         if block_message is not None:
             return json.dumps({"error": block_message}, ensure_ascii=False)
+        if (
+            function_name in self.valid_tool_names
+            and function_name not in self.authorized_tool_names
+        ):
+            return json.dumps(
+                {"error": f"Tool '{function_name}' is not authorized in this session"},
+                ensure_ascii=False,
+            )
 
         if function_name == "todo":
             from tools.todo_tool import todo_tool as _todo_tool
@@ -9150,6 +9204,10 @@ class AIAgent:
                         _fenced = build_memory_context_block(_ext_prefetch_cache)
                         if _fenced:
                             _injections.append(_fenced)
+                    if self.context_pack:
+                        _context_pack = self.context_pack.render()
+                        if _context_pack:
+                            _injections.append(_context_pack)
                     if _plugin_user_context:
                         _injections.append(_plugin_user_context)
                     if _injections:
