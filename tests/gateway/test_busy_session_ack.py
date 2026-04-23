@@ -58,12 +58,15 @@ def _make_event(text="hello", chat_id="123", platform_val="telegram"):
 def _make_runner():
     """Build a minimal GatewayRunner-like object for testing."""
     from gateway.run import GatewayRunner, _AGENT_PENDING_SENTINEL
+    from gateway.run_queue import GatewayRunQueue
 
     runner = object.__new__(GatewayRunner)
-    runner._running_agents = {}
-    runner._running_agents_ts = {}
-    runner._pending_messages = {}
-    runner._busy_ack_ts = {}
+    runner._run_queue = GatewayRunQueue()
+    runner._session_actors = runner._run_queue.actors
+    runner._running_agents = runner._run_queue.running_agents
+    runner._running_agents_ts = runner._run_queue.running_agents_ts
+    runner._pending_messages = runner._run_queue.pending_messages
+    runner._busy_ack_ts = runner._run_queue.busy_ack_ts
     runner._draining = False
     runner.adapters = {}
     runner.config = MagicMock()

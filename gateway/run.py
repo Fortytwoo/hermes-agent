@@ -297,6 +297,7 @@ from gateway.restart import (
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     parse_restart_drain_timeout,
 )
+from gateway.run_queue import GatewayRunQueue
 
 
 def _normalize_whatsapp_identifier(value: str) -> str:
@@ -659,14 +660,14 @@ class GatewayRunner:
         self._restart_detached = False
         self._restart_via_service = False
         self._stop_task: Optional[asyncio.Task] = None
-        
-        # Track running agents per session for interrupt support
-        # Key: session_key, Value: AIAgent instance
-        self._running_agents: Dict[str, Any] = {}
-        self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
-        self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
-        self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
-        self._session_run_generation: Dict[str, int] = {}
+
+        self._run_queue = GatewayRunQueue()
+        self._session_actors = self._run_queue.actors
+        self._running_agents = self._run_queue.running_agents
+        self._running_agents_ts = self._run_queue.running_agents_ts
+        self._pending_messages = self._run_queue.pending_messages
+        self._busy_ack_ts = self._run_queue.busy_ack_ts
+        self._session_run_generation = self._run_queue.run_generations
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
@@ -687,7 +688,7 @@ class GatewayRunner:
         self._session_model_overrides: Dict[str, Dict[str, str]] = {}
         # Track pending exec approvals per session
         # Key: session_key, Value: {"command": str, "pattern_key": str, ...}
-        self._pending_approvals: Dict[str, Dict[str, Any]] = {}
+        self._pending_approvals = self._run_queue.pending_approvals
 
         # Track platforms that failed to connect for background reconnection.
         # Key: Platform enum, Value: {"config": platform_config, "attempts": int, "next_retry": float}
@@ -695,7 +696,7 @@ class GatewayRunner:
 
         # Track pending /update prompt responses per session.
         # Key: session_key, Value: True when a prompt is waiting for user input.
-        self._update_prompt_pending: Dict[str, bool] = {}
+        self._update_prompt_pending = self._run_queue.update_prompt_pending
 
         # Persistent Honcho managers keyed by gateway session key.
         # This preserves write_frequency="session" semantics across short-lived
@@ -1226,6 +1227,9 @@ class GatewayRunner:
         self._shutdown_event.set()
 
     def _running_agent_count(self) -> int:
+        run_queue = getattr(self, "_run_queue", None)
+        if run_queue is not None and getattr(self, "_running_agents", None) is run_queue.running_agents:
+            return run_queue.running_count()
         return len(self._running_agents)
 
     def _status_action_label(self) -> str:
@@ -1505,6 +1509,9 @@ class GatewayRunner:
         return None
 
     def _snapshot_running_agents(self) -> Dict[str, Any]:
+        run_queue = getattr(self, "_run_queue", None)
+        if run_queue is not None and getattr(self, "_running_agents", None) is run_queue.running_agents:
+            return run_queue.snapshot_running_agents(_AGENT_PENDING_SENTINEL)
         return {
             session_key: agent
             for session_key, agent in self._running_agents.items()
@@ -1615,6 +1622,13 @@ class GatewayRunner:
         return True
 
     async def _drain_active_agents(self, timeout: float) -> tuple[Dict[str, Any], bool]:
+        run_queue = getattr(self, "_run_queue", None)
+        if run_queue is not None and getattr(self, "_running_agents", None) is run_queue.running_agents:
+            return await run_queue.drain_active(
+                timeout=timeout,
+                update_status=lambda: self._update_runtime_status("draining"),
+                pending_sentinel=_AGENT_PENDING_SENTINEL,
+            )
         snapshot = self._snapshot_running_agents()
         last_active_count = self._running_agent_count()
         last_status_at = 0.0
@@ -1645,6 +1659,16 @@ class GatewayRunner:
         return snapshot, timed_out
 
     def _interrupt_running_agents(self, reason: str) -> None:
+        run_queue = getattr(self, "_run_queue", None)
+        if run_queue is not None and getattr(self, "_running_agents", None) is run_queue.running_agents:
+            try:
+                run_queue.interrupt_running_agents(
+                    reason,
+                    pending_sentinel=_AGENT_PENDING_SENTINEL,
+                )
+                return
+            except Exception as e:
+                logger.debug("Failed interrupting agent during shutdown: %s", e)
         for session_key, agent in list(self._running_agents.items()):
             if agent is _AGENT_PENDING_SENTINEL:
                 continue
@@ -2635,12 +2659,26 @@ class GatewayRunner:
             self._background_tasks.clear()
 
             self.adapters.clear()
-            self._running_agents.clear()
-            self._running_agents_ts.clear()
-            self._pending_messages.clear()
-            self._pending_approvals.clear()
-            if hasattr(self, '_busy_ack_ts'):
-                self._busy_ack_ts.clear()
+            run_queue = getattr(self, "_run_queue", None)
+            if run_queue is not None:
+                run_queue.clear_all_runtime_state()
+                if getattr(self, "_running_agents", None) is not run_queue.running_agents:
+                    self._running_agents.clear()
+                if getattr(self, "_running_agents_ts", None) is not run_queue.running_agents_ts:
+                    self._running_agents_ts.clear()
+                if getattr(self, "_pending_messages", None) is not run_queue.pending_messages:
+                    self._pending_messages.clear()
+                if getattr(self, "_pending_approvals", None) is not run_queue.pending_approvals:
+                    self._pending_approvals.clear()
+                if getattr(self, "_busy_ack_ts", None) is not run_queue.busy_ack_ts and hasattr(self, "_busy_ack_ts"):
+                    self._busy_ack_ts.clear()
+            else:
+                self._running_agents.clear()
+                self._running_agents_ts.clear()
+                self._pending_messages.clear()
+                self._pending_approvals.clear()
+                if hasattr(self, "_busy_ack_ts"):
+                    self._busy_ack_ts.clear()
             self._shutdown_event.set()
 
             # Global cleanup: kill any remaining tool subprocesses not tied
@@ -8623,6 +8661,10 @@ class GatewayRunner:
         """
         if not session_key:
             return
+        run_queue = getattr(self, "_run_queue", None)
+        if run_queue is not None and getattr(self, "_running_agents", None) is run_queue.running_agents:
+            run_queue.release_running_state(session_key)
+            return
         self._running_agents.pop(session_key, None)
         self._running_agents_ts.pop(session_key, None)
         if hasattr(self, "_busy_ack_ts"):
@@ -8638,6 +8680,9 @@ class GatewayRunner:
         """
         if not session_key:
             return 0
+        run_queue = getattr(self, "_run_queue", None)
+        if run_queue is not None:
+            return run_queue.begin_run_generation(session_key)
         generations = self.__dict__.get("_session_run_generation")
         if generations is None:
             generations = {}
@@ -8662,6 +8707,9 @@ class GatewayRunner:
         """Return True when ``generation`` is still current for ``session_key``."""
         if not session_key:
             return True
+        run_queue = getattr(self, "_run_queue", None)
+        if run_queue is not None:
+            return run_queue.is_run_generation_current(session_key, generation)
         generations = self.__dict__.get("_session_run_generation") or {}
         return int(generations.get(session_key, 0)) == int(generation)
 
