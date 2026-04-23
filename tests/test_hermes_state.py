@@ -355,6 +355,27 @@ class TestFTS5Search:
         roles = [r["role"] for r in results]
         assert all(r == "assistant" for r in roles)
 
+    def test_search_messages_filters_enterprise_scope_on_fts_path(self, db):
+        scope = EnterpriseScope(tenant_id="acme", workspace_id="ops", agent_id="planner")
+
+        db.create_session("scoped", "cli", enterprise_scope=scope)
+        db.append_message("scoped", "user", "Docker rollout checklist")
+
+        db.create_session(
+            "foreign",
+            "cli",
+            enterprise_scope=EnterpriseScope(
+                tenant_id="other",
+                workspace_id="ops",
+                agent_id="planner",
+            ),
+        )
+        db.append_message("foreign", "user", "Docker rollout checklist")
+
+        results = db.search_messages("Docker", enterprise_scope=scope)
+
+        assert {row["session_id"] for row in results} == {"scoped"}
+
     def test_search_returns_context(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="Tell me about Kubernetes")
@@ -622,6 +643,27 @@ class TestCJKSearchFallback:
         results = db.search_messages("记忆断裂", role_filter=["assistant"])
         assert len(results) == 1
         assert results[0]["role"] == "assistant"
+
+    def test_cjk_fallback_filters_enterprise_scope(self, db):
+        scope = EnterpriseScope(tenant_id="acme", workspace_id="ops", agent_id="planner")
+
+        db.create_session("scoped-cjk", "cli", enterprise_scope=scope)
+        db.append_message("scoped-cjk", "user", "用户问记忆断裂怎么处理")
+
+        db.create_session(
+            "foreign-cjk",
+            "cli",
+            enterprise_scope=EnterpriseScope(
+                tenant_id="other",
+                workspace_id="ops",
+                agent_id="planner",
+            ),
+        )
+        db.append_message("foreign-cjk", "user", "用户问记忆断裂怎么处理")
+
+        results = db.search_messages("记忆断裂", enterprise_scope=scope)
+
+        assert {row["session_id"] for row in results} == {"scoped-cjk"}
 
     def test_cjk_snippet_is_centered_on_match(self, db):
         """Snippet should contain the search term, not just the first N chars."""
@@ -1480,6 +1522,40 @@ class TestCompressionChainProjection:
         # root1's tip must be tip1 (via mid1), not delegate1.
         assert db.get_compression_tip("root1") == "tip1"
 
+    def test_get_compression_tip_stays_within_enterprise_scope(self, db):
+        import time as _time
+
+        scope = EnterpriseScope(tenant_id="acme", workspace_id="ops", agent_id="planner")
+        other_scope = EnterpriseScope(tenant_id="other", workspace_id="ops", agent_id="planner")
+        t0 = _time.time() - 3600
+
+        db.create_session("root-scope", "cli", enterprise_scope=scope)
+        db._conn.execute("UPDATE sessions SET started_at=?, ended_at=?, end_reason=? WHERE id=?", (
+            t0,
+            t0 + 10,
+            "compression",
+            "root-scope",
+        ))
+
+        db.create_session(
+            "tip-in-scope",
+            "cli",
+            parent_session_id="root-scope",
+            enterprise_scope=scope,
+        )
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 11, "tip-in-scope"))
+
+        db.create_session(
+            "tip-out-of-scope",
+            "cli",
+            parent_session_id="root-scope",
+            enterprise_scope=other_scope,
+        )
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 12, "tip-out-of-scope"))
+        db._conn.commit()
+
+        assert db.get_compression_tip("root-scope", enterprise_scope=scope) == "tip-in-scope"
+
     def test_list_surfaces_tip_for_compressed_root(self, db):
         """The list must show the tip's id/message_count/preview in place of
         the root row, so users can see and resume the live conversation.
@@ -1548,6 +1624,49 @@ class TestCompressionChainProjection:
         # 'newer' started AFTER root1 but BEFORE tip1's actual started_at.
         # Correct ordering (by root started_at): newer > tip1's lineage entry.
         assert ids_in_order.index("newer") < ids_in_order.index("tip1")
+
+    def test_list_sessions_rich_filters_enterprise_scope_and_tip_projection(self, db):
+        import time as _time
+
+        scope = EnterpriseScope(tenant_id="acme", workspace_id="ops", agent_id="planner")
+        other_scope = EnterpriseScope(tenant_id="other", workspace_id="ops", agent_id="planner")
+        t0 = _time.time() - 3600
+
+        db.create_session("root-scoped", "cli", enterprise_scope=scope)
+        db._conn.execute("UPDATE sessions SET started_at=?, ended_at=?, end_reason=? WHERE id=?", (
+            t0,
+            t0 + 10,
+            "compression",
+            "root-scoped",
+        ))
+
+        db.create_session(
+            "tip-scoped",
+            "cli",
+            parent_session_id="root-scoped",
+            enterprise_scope=scope,
+        )
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 11, "tip-scoped"))
+        db.append_message("tip-scoped", "user", "scoped continuation")
+
+        db.create_session(
+            "tip-foreign",
+            "cli",
+            parent_session_id="root-scoped",
+            enterprise_scope=other_scope,
+        )
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 12, "tip-foreign"))
+        db.append_message("tip-foreign", "user", "foreign continuation")
+
+        db.create_session("other-root", "cli", enterprise_scope=other_scope)
+        db.append_message("other-root", "user", "other tenant session")
+        db._conn.commit()
+
+        sessions = db.list_sessions_rich(source="cli", limit=20, enterprise_scope=scope)
+
+        assert [row["id"] for row in sessions] == ["tip-scoped"]
+        assert sessions[0]["_lineage_root_id"] == "root-scoped"
+        assert sessions[0]["preview"].startswith("scoped continuation")
 
     def test_list_handles_broken_chain_gracefully(self, db):
         """A compression root with no child (e.g. DB corruption or a partial
