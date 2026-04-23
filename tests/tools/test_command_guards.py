@@ -33,11 +33,16 @@ _TIRITH_PATCH = "tools.tirith_security.check_command_security"
 
 
 @pytest.fixture(autouse=True)
-def _clean_state():
+def _clean_state(monkeypatch):
     """Clear approval state and relevant env vars between tests."""
     approval_module._session_approved.clear()
     approval_module._pending.clear()
     approval_module._permanent_approved.clear()
+    monkeypatch.setattr(
+        tools.tirith_security,
+        "ensure_installed",
+        lambda **kwargs: "/tmp/tirith",
+    )
     saved = {}
     for k in ("HERMES_INTERACTIVE", "HERMES_GATEWAY_SESSION", "HERMES_EXEC_ASK", "HERMES_YOLO_MODE"):
         if k in os.environ:

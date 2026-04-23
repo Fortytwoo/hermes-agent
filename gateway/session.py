@@ -16,7 +16,7 @@ import threading
 import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any
 
 logger = logging.getLogger(__name__)
@@ -60,6 +60,15 @@ from .config import (
     SessionResetPolicy,  # noqa: F401 — re-exported via gateway/__init__.py
     HomeChannel,
 )
+from agent.scope import (
+    EnterpriseScope,
+    SessionAddress,
+    address_from_dict,
+    address_to_dict,
+    scope_from_dict,
+    scope_to_dict,
+)
+from agent.scope_resolver import resolve_enterprise_scope, resolve_session_address
 
 
 @dataclass
@@ -153,6 +162,8 @@ class SessionContext:
     connected_platforms: List[Platform]
     home_channels: Dict[Platform, HomeChannel]
     shared_multi_user_session: bool = False
+    enterprise_scope: EnterpriseScope = field(default_factory=EnterpriseScope)
+    session_address: SessionAddress = field(default_factory=SessionAddress)
     
     # Session metadata
     session_key: str = ""
@@ -168,6 +179,8 @@ class SessionContext:
                 p.value: hc.to_dict() for p, hc in self.home_channels.items()
             },
             "shared_multi_user_session": self.shared_multi_user_session,
+            "enterprise_scope": scope_to_dict(self.enterprise_scope),
+            "session_address": address_to_dict(self.session_address),
             "session_key": self.session_key,
             "session_id": self.session_id,
             "created_at": self.created_at.isoformat() if self.created_at else None,
@@ -340,6 +353,10 @@ class SessionEntry:
     session_id: str
     created_at: datetime
     updated_at: datetime
+
+    # Typed session boundary metadata
+    enterprise_scope: EnterpriseScope = field(default_factory=EnterpriseScope)
+    session_address: SessionAddress = field(default_factory=SessionAddress)
     
     # Origin metadata for delivery routing
     origin: Optional[SessionSource] = None
@@ -396,6 +413,8 @@ class SessionEntry:
             "session_id": self.session_id,
             "created_at": self.created_at.isoformat(),
             "updated_at": self.updated_at.isoformat(),
+            "enterprise_scope": scope_to_dict(self.enterprise_scope),
+            "session_address": address_to_dict(self.session_address),
             "display_name": self.display_name,
             "platform": self.platform.value if self.platform else None,
             "chat_type": self.chat_type,
@@ -447,6 +466,8 @@ class SessionEntry:
             session_id=data["session_id"],
             created_at=datetime.fromisoformat(data["created_at"]),
             updated_at=datetime.fromisoformat(data["updated_at"]),
+            enterprise_scope=scope_from_dict(data.get("enterprise_scope")),
+            session_address=address_from_dict(data.get("session_address")),
             origin=origin,
             display_name=data.get("display_name"),
             platform=platform,
@@ -545,6 +566,31 @@ def build_session_key(
         key_parts.append(str(participant_id))
 
     return ":".join(key_parts)
+
+
+def _encode_scoped_component(value: str) -> str:
+    return value if value else "_"
+
+
+def build_scoped_session_key(
+    enterprise_scope: EnterpriseScope,
+    session_address: SessionAddress,
+) -> str:
+    """Build the tagged scoped session-key format for future enterprise cutover."""
+    parts = [
+        "agent", "scope", "v1",
+        "tenant", _encode_scoped_component(enterprise_scope.tenant_id),
+        "workspace", _encode_scoped_component(enterprise_scope.workspace_id),
+        "agent", _encode_scoped_component(enterprise_scope.agent_id or "main"),
+        "platform", _encode_scoped_component(session_address.platform),
+        "chat_type", _encode_scoped_component(session_address.chat_type),
+        "chat", _encode_scoped_component(session_address.chat_id),
+    ]
+    if session_address.thread_id:
+        parts.extend(["thread", session_address.thread_id])
+    if session_address.user_id:
+        parts.extend(["user", session_address.user_id])
+    return ":".join(parts)
 
 
 class SessionStore:
@@ -798,12 +844,16 @@ class SessionStore:
 
             # Create new session
             session_id = f"{now.strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
+            enterprise_scope = resolve_enterprise_scope()
+            session_address = resolve_session_address(source)
 
             entry = SessionEntry(
                 session_key=session_key,
                 session_id=session_id,
                 created_at=now,
                 updated_at=now,
+                enterprise_scope=enterprise_scope,
+                session_address=session_address,
                 origin=source,
                 display_name=source.chat_name,
                 platform=source.platform,
@@ -819,6 +869,8 @@ class SessionStore:
                 "session_id": session_id,
                 "source": source.platform.value,
                 "user_id": source.user_id,
+                "enterprise_scope": enterprise_scope,
+                "session_address": session_address,
             }
 
         # SQLite operations outside the lock
@@ -1027,6 +1079,8 @@ class SessionStore:
                 session_id=session_id,
                 created_at=now,
                 updated_at=now,
+                enterprise_scope=old_entry.enterprise_scope,
+                session_address=old_entry.session_address,
                 origin=old_entry.origin,
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
@@ -1039,6 +1093,8 @@ class SessionStore:
                 "session_id": session_id,
                 "source": old_entry.platform.value if old_entry.platform else "unknown",
                 "user_id": old_entry.origin.user_id if old_entry.origin else None,
+                "enterprise_scope": old_entry.enterprise_scope,
+                "session_address": old_entry.session_address,
             }
 
         if self._db and db_end_session_id:
@@ -1087,6 +1143,8 @@ class SessionStore:
                 session_id=target_session_id,
                 created_at=now,
                 updated_at=now,
+                enterprise_scope=old_entry.enterprise_scope,
+                session_address=old_entry.session_address,
                 origin=old_entry.origin,
                 display_name=old_entry.display_name,
                 platform=old_entry.platform,
@@ -1271,5 +1329,7 @@ def build_session_context(
         context.session_id = session_entry.session_id
         context.created_at = session_entry.created_at
         context.updated_at = session_entry.updated_at
+        context.enterprise_scope = session_entry.enterprise_scope
+        context.session_address = session_entry.session_address
     
     return context

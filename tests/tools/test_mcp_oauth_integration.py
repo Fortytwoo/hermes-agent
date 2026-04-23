@@ -10,6 +10,7 @@ flow without requiring a restart.
 import asyncio
 import json
 import os
+import signal
 import time
 
 import pytest
@@ -29,6 +30,11 @@ async def test_external_refresh_picked_up_without_restart(tmp_path, monkeypatch)
     4. ``provider.context.current_tokens`` now reflects the new tokens
        with no process restart required.
     """
+    # The real MCP SDK initialization path can exceed the suite's default
+    # 30s alarm under xdist load even though the test is healthy. Bump the
+    # per-test budget on Unix so this end-to-end path can complete.
+    if os.name != "nt":
+        signal.alarm(90)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
 
     from tools.mcp_oauth_manager import MCPOAuthManager, reset_manager_for_tests

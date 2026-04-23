@@ -304,6 +304,29 @@ def test_build_process_event_source_falls_back_to_session_key_chat_type(monkeypa
     assert source.user_name == "Emiliyan"
 
 
+def test_build_process_event_source_falls_back_to_scoped_session_key(monkeypatch, tmp_path):
+    runner = _build_runner(monkeypatch, tmp_path, "all")
+
+    evt = {
+        "session_id": "proc_watch",
+        "session_key": (
+            "agent:scope:v1:tenant:acme:workspace:ops:agent:planner:"
+            "platform:telegram:chat_type:group:chat:-100:thread:42:user:123"
+        ),
+        "user_name": "Emiliyan",
+    }
+
+    source = runner._build_process_event_source(evt)
+
+    assert source is not None
+    assert source.platform == Platform.TELEGRAM
+    assert source.chat_id == "-100"
+    assert source.chat_type == "group"
+    assert source.thread_id == "42"
+    assert source.user_id == "123"
+    assert source.user_name == "Emiliyan"
+
+
 @pytest.mark.asyncio
 async def test_inject_watch_notification_ignores_foreground_event_source(monkeypatch, tmp_path):
     """Negative test: watch notification must NOT route to the foreground thread."""
@@ -404,6 +427,14 @@ def test_parse_session_key_thread_chat_type():
     """Thread-typed keys use parts[5] as thread_id unambiguously."""
     result = _parse_session_key("agent:main:discord:thread:chan1:thread99")
     assert result == {"platform": "discord", "chat_type": "thread", "chat_id": "chan1", "thread_id": "thread99"}
+
+
+def test_parse_session_key_scoped_format():
+    result = _parse_session_key(
+        "agent:scope:v1:tenant:acme:workspace:ops:agent:planner:"
+        "platform:telegram:chat_type:group:chat:-100:thread:42:user:alice"
+    )
+    assert result == {"platform": "telegram", "chat_type": "group", "chat_id": "-100", "thread_id": "42"}
 
 
 def test_parse_session_key_too_short():

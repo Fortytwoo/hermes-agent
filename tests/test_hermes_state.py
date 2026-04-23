@@ -4,6 +4,7 @@ import time
 import pytest
 from pathlib import Path
 
+from agent.scope import EnterpriseScope, SessionAddress
 from hermes_state import SessionDB
 
 
@@ -1120,7 +1121,7 @@ class TestSchemaInit:
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 6
+        assert version == 7
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
@@ -1176,12 +1177,12 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v6
+        # Open with SessionDB — should migrate to v7
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 6
+        assert cursor.fetchone()[0] == 7
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")
@@ -1732,3 +1733,172 @@ class TestConcurrentWriteSafety:
         assert "30" in src, (
             "SQLite timeout should be at least 30s to handle CLI/gateway lock contention"
         )
+
+
+class TestSessionScopeMetadata:
+    def test_schema_version_is_v7(self, db):
+        cursor = db._conn.execute("SELECT version FROM schema_version")
+        version = cursor.fetchone()[0]
+        assert version == 7
+
+    def test_scope_columns_exist(self, db):
+        cursor = db._conn.execute("PRAGMA table_info(sessions)")
+        columns = {row[1] for row in cursor.fetchall()}
+        assert "tenant_id" in columns
+        assert "workspace_id" in columns
+        assert "agent_id" in columns
+        assert "chat_id" in columns
+        assert "thread_id" in columns
+        assert "chat_type" in columns
+
+    def test_create_session_persists_scope_and_address(self, db):
+        db.create_session(
+            session_id="scoped-1",
+            source="telegram",
+            enterprise_scope=EnterpriseScope(
+                tenant_id="acme",
+                workspace_id="ops",
+                agent_id="planner",
+            ),
+            session_address=SessionAddress(
+                source="telegram",
+                platform="telegram",
+                chat_type="group",
+                chat_id="-100",
+                thread_id="42",
+                user_id="alice",
+            ),
+        )
+
+        row = db.get_session("scoped-1")
+
+        assert row["tenant_id"] == "acme"
+        assert row["workspace_id"] == "ops"
+        assert row["agent_id"] == "planner"
+        assert row["chat_id"] == "-100"
+        assert row["thread_id"] == "42"
+        assert row["chat_type"] == "group"
+
+    def test_ensure_session_persists_scope_and_address_when_creating_row(self, db):
+        db.ensure_session(
+            "scoped-late",
+            source="gateway",
+            model="gpt-test",
+            enterprise_scope=EnterpriseScope(
+                tenant_id="acme",
+                workspace_id="ops",
+                agent_id="planner",
+            ),
+            session_address=SessionAddress(
+                source="telegram",
+                platform="telegram",
+                chat_type="group",
+                chat_id="-100",
+                thread_id="42",
+                user_id="alice",
+            ),
+        )
+
+        row = db.get_session("scoped-late")
+
+        assert row["source"] == "gateway"
+        assert row["model"] == "gpt-test"
+        assert row["tenant_id"] == "acme"
+        assert row["workspace_id"] == "ops"
+        assert row["agent_id"] == "planner"
+        assert row["chat_id"] == "-100"
+        assert row["thread_id"] == "42"
+        assert row["chat_type"] == "group"
+
+    def test_legacy_create_session_call_still_works(self, db):
+        db.create_session(session_id="legacy-call", source="cli")
+
+        row = db.get_session("legacy-call")
+
+        assert row is not None
+        assert row["source"] == "cli"
+        assert row["tenant_id"] is None
+        assert row["workspace_id"] is None
+        assert row["agent_id"] is None
+        assert row["chat_id"] is None
+        assert row["thread_id"] is None
+        assert row["chat_type"] is None
+
+    def test_migration_from_v6_adds_scope_columns(self, tmp_path):
+        import sqlite3
+
+        db_path = tmp_path / "migrate_scope_v7.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(
+            """
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version (version) VALUES (6);
+
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                user_id TEXT,
+                model TEXT,
+                model_config TEXT,
+                system_prompt TEXT,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL,
+                end_reason TEXT,
+                message_count INTEGER DEFAULT 0,
+                tool_call_count INTEGER DEFAULT 0,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                cache_write_tokens INTEGER DEFAULT 0,
+                reasoning_tokens INTEGER DEFAULT 0,
+                billing_provider TEXT,
+                billing_base_url TEXT,
+                billing_mode TEXT,
+                estimated_cost_usd REAL,
+                actual_cost_usd REAL,
+                cost_status TEXT,
+                cost_source TEXT,
+                pricing_version TEXT,
+                title TEXT
+            );
+
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                tool_call_id TEXT,
+                tool_calls TEXT,
+                tool_name TEXT,
+                timestamp REAL NOT NULL,
+                token_count INTEGER,
+                finish_reason TEXT,
+                reasoning TEXT,
+                reasoning_details TEXT,
+                codex_reasoning_items TEXT
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+            ("existing-v6", "cli", 1000.0),
+        )
+        conn.commit()
+        conn.close()
+
+        migrated_db = SessionDB(db_path=db_path)
+
+        cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
+        assert cursor.fetchone()[0] == 7
+
+        session = migrated_db.get_session("existing-v6")
+        assert session is not None
+        assert session["tenant_id"] is None
+        assert session["workspace_id"] is None
+        assert session["agent_id"] is None
+        assert session["chat_id"] is None
+        assert session["thread_id"] is None
+        assert session["chat_type"] is None
+
+        migrated_db.close()

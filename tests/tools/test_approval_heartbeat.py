@@ -63,6 +63,7 @@ class TestApprovalHeartbeat:
         """touch_activity_if_due is called repeatedly during the wait."""
         from tools.approval import (
             check_all_command_guards,
+            has_blocking_approval,
             register_gateway_notify,
             resolve_gateway_approval,
         )
@@ -131,6 +132,7 @@ class TestApprovalHeartbeat:
         """Polling slices don't delay responsiveness — resolve is near-instant."""
         from tools.approval import (
             check_all_command_guards,
+            has_blocking_approval,
             register_gateway_notify,
             resolve_gateway_approval,
         )
@@ -148,9 +150,14 @@ class TestApprovalHeartbeat:
         thread = threading.Thread(target=_run_check, daemon=True)
         thread.start()
 
-        # Resolve almost immediately — the wait loop should return within
-        # its current 1s poll slice.
-        time.sleep(0.1)
+        # Wait until the blocking approval is actually queued; resolving too
+        # early races with module import/setup and can drop the signal before
+        # the worker starts waiting.
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if has_blocking_approval(self.SESSION_KEY):
+                break
+            time.sleep(0.05)
         resolve_gateway_approval(self.SESSION_KEY, "once")
         thread.join(timeout=5)
         elapsed = time.monotonic() - start_time
@@ -166,6 +173,7 @@ class TestApprovalHeartbeat:
         """If tools.environments.base can't be imported, the wait still works."""
         from tools.approval import (
             check_all_command_guards,
+            has_blocking_approval,
             register_gateway_notify,
             resolve_gateway_approval,
         )
@@ -191,7 +199,11 @@ class TestApprovalHeartbeat:
         thread = threading.Thread(target=_run_check, daemon=True)
         thread.start()
 
-        time.sleep(0.2)
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if has_blocking_approval(self.SESSION_KEY):
+                break
+            time.sleep(0.05)
         resolve_gateway_approval(self.SESSION_KEY, "once")
         thread.join(timeout=5)
 

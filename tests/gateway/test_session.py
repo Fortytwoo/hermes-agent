@@ -4,6 +4,7 @@ import json
 import pytest
 from pathlib import Path
 from unittest.mock import patch, MagicMock
+from agent.scope import EnterpriseScope, SessionAddress
 from gateway.config import Platform, HomeChannel, GatewayConfig, PlatformConfig
 from gateway.session import (
     SessionSource,
@@ -142,6 +143,51 @@ class TestSessionSourceDescription:
             chat_type="forum", chat_name="Questions",
         )
         assert "Questions" in source.description
+
+
+class TestSessionStoreSQLiteScopePersistence:
+    def test_new_session_passes_scope_and_address_to_sqlite(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_SCOPE_TENANT_ID", "tenant-a")
+        monkeypatch.setenv("HERMES_SCOPE_WORKSPACE_ID", "workspace-a")
+        monkeypatch.setenv("HERMES_SCOPE_AGENT_ID", "agent-a")
+
+        store = SessionStore(
+            tmp_path / "sessions",
+            GatewayConfig(
+                platforms={Platform.WEBHOOK: PlatformConfig(enabled=True)},
+            ),
+        )
+        store._db = MagicMock()
+
+        source = SessionSource(
+            platform=Platform.WEBHOOK,
+            chat_id="webhook:a-phase:delivery-1",
+            chat_name="webhook/a-phase",
+            chat_type="webhook",
+            user_id="webhook:a-phase",
+            thread_id="thread-1",
+        )
+
+        entry = store.get_or_create_session(source)
+
+        store._db.create_session.assert_called_once()
+        kwargs = store._db.create_session.call_args.kwargs
+        assert kwargs["session_id"] == entry.session_id
+        assert kwargs["source"] == "webhook"
+        assert kwargs["user_id"] == "webhook:a-phase"
+        assert kwargs["enterprise_scope"] == EnterpriseScope(
+            tenant_id="tenant-a",
+            workspace_id="workspace-a",
+            agent_id="agent-a",
+        )
+        assert kwargs["session_address"] == SessionAddress(
+            source="webhook",
+            platform="webhook",
+            chat_type="webhook",
+            chat_id="webhook:a-phase:delivery-1",
+            thread_id="thread-1",
+            user_id="webhook:a-phase",
+        )
 
 
 class TestLocalCliFactory:
@@ -926,6 +972,186 @@ class TestHasAnySessions:
 
         store._entries = {"key1": MagicMock()}
         assert store.has_any_sessions() is False
+
+
+class TestScopedSessionMetadata:
+    def test_build_scoped_session_key_uses_tagged_format(self):
+        from gateway import session as session_mod
+
+        key = session_mod.build_scoped_session_key(
+            EnterpriseScope(
+                tenant_id="acme",
+                workspace_id="ops",
+                agent_id="planner",
+            ),
+            SessionAddress(
+                platform="telegram",
+                chat_type="group",
+                chat_id="-100",
+                thread_id="42",
+                user_id="alice",
+            ),
+        )
+
+        assert (
+            key
+            == "agent:scope:v1:tenant:acme:workspace:ops:agent:planner:"
+            "platform:telegram:chat_type:group:chat:-100:thread:42:user:alice"
+        )
+
+    def test_session_entry_roundtrip_preserves_typed_metadata(self):
+        from gateway.session import SessionEntry
+        from datetime import datetime
+
+        entry = SessionEntry(
+            session_key="agent:main:telegram:group:-100:alice",
+            session_id="s1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            enterprise_scope=EnterpriseScope(
+                tenant_id="acme",
+                workspace_id="ops",
+                agent_id="planner",
+            ),
+            session_address=SessionAddress(
+                source="telegram",
+                platform="telegram",
+                chat_type="group",
+                chat_id="-100",
+                thread_id="42",
+                user_id="alice",
+            ),
+        )
+
+        restored = SessionEntry.from_dict(entry.to_dict())
+
+        assert restored.enterprise_scope == EnterpriseScope(
+            tenant_id="acme",
+            workspace_id="ops",
+            agent_id="planner",
+        )
+        assert restored.session_address == SessionAddress(
+            source="telegram",
+            platform="telegram",
+            chat_type="group",
+            chat_id="-100",
+            thread_id="42",
+            user_id="alice",
+        )
+
+    def test_reset_session_preserves_typed_metadata(self, tmp_path):
+        from gateway.session import SessionEntry
+        from datetime import datetime
+
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+        store._db = None
+        store._save = MagicMock()
+
+        old_entry = SessionEntry(
+            session_key="agent:main:telegram:group:-100:alice",
+            session_id="old-session",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            enterprise_scope=EnterpriseScope(
+                tenant_id="acme",
+                workspace_id="ops",
+                agent_id="planner",
+            ),
+            session_address=SessionAddress(
+                source="telegram",
+                platform="telegram",
+                chat_type="group",
+                chat_id="-100",
+                thread_id="42",
+                user_id="alice",
+            ),
+        )
+        store._entries = {old_entry.session_key: old_entry}
+
+        new_entry = store.reset_session(old_entry.session_key)
+
+        assert new_entry is not None
+        assert new_entry.session_id != old_entry.session_id
+        assert new_entry.enterprise_scope == old_entry.enterprise_scope
+        assert new_entry.session_address == old_entry.session_address
+
+    def test_switch_session_preserves_typed_metadata(self, tmp_path):
+        from gateway.session import SessionEntry
+        from datetime import datetime
+
+        config = GatewayConfig()
+        with patch("gateway.session.SessionStore._ensure_loaded"):
+            store = SessionStore(sessions_dir=tmp_path, config=config)
+        store._loaded = True
+        store._db = None
+        store._save = MagicMock()
+
+        old_entry = SessionEntry(
+            session_key="agent:main:telegram:group:-100:alice",
+            session_id="current-session",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            enterprise_scope=EnterpriseScope(
+                tenant_id="acme",
+                workspace_id="ops",
+                agent_id="planner",
+            ),
+            session_address=SessionAddress(
+                source="telegram",
+                platform="telegram",
+                chat_type="group",
+                chat_id="-100",
+                thread_id="42",
+                user_id="alice",
+            ),
+        )
+        store._entries = {old_entry.session_key: old_entry}
+
+        switched = store.switch_session(old_entry.session_key, "restored-session")
+
+        assert switched is not None
+        assert switched.session_id == "restored-session"
+        assert switched.enterprise_scope == old_entry.enterprise_scope
+        assert switched.session_address == old_entry.session_address
+
+    def test_build_session_context_copies_typed_metadata_from_entry(self):
+        from gateway.session import SessionEntry
+        from datetime import datetime
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            chat_id="-100",
+            chat_type="group",
+            user_id="alice",
+            thread_id="42",
+        )
+        entry = SessionEntry(
+            session_key="agent:main:telegram:group:-100:alice",
+            session_id="s1",
+            created_at=datetime.now(),
+            updated_at=datetime.now(),
+            enterprise_scope=EnterpriseScope(
+                tenant_id="acme",
+                workspace_id="ops",
+                agent_id="planner",
+            ),
+            session_address=SessionAddress(
+                source="telegram",
+                platform="telegram",
+                chat_type="group",
+                chat_id="-100",
+                thread_id="42",
+                user_id="alice",
+            ),
+        )
+
+        context = build_session_context(source, GatewayConfig(), session_entry=entry)
+
+        assert context.enterprise_scope == entry.enterprise_scope
+        assert context.session_address == entry.session_address
 
 
 class TestLastPromptTokens:

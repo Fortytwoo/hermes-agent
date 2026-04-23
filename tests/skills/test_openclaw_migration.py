@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import shutil
 import sys
 from pathlib import Path
 
@@ -17,15 +18,22 @@ SCRIPT_PATH = (
 
 
 def load_module():
+    old_flag = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
     spec = importlib.util.spec_from_file_location("openclaw_to_hermes", SCRIPT_PATH)
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    try:
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.dont_write_bytecode = old_flag
 
 
 def load_skills_guard():
+    old_flag = sys.dont_write_bytecode
+    sys.dont_write_bytecode = True
     spec = importlib.util.spec_from_file_location(
         "skills_guard_local",
         Path(__file__).resolve().parents[2] / "tools" / "skills_guard.py",
@@ -33,8 +41,24 @@ def load_skills_guard():
     module = importlib.util.module_from_spec(spec)
     assert spec.loader is not None
     sys.modules[spec.name] = module
-    spec.loader.exec_module(module)
-    return module
+    try:
+        spec.loader.exec_module(module)
+        return module
+    finally:
+        sys.dont_write_bytecode = old_flag
+
+
+def _copy_skill_tree_for_scan(tmp_path: Path) -> Path:
+    target = tmp_path / "openclaw-migration"
+    shutil.copytree(
+        SCRIPT_PATH.parents[1],
+        target,
+        ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
+    )
+    skill_md = target / "SKILL.md"
+    if skill_md.exists():
+        skill_md.chmod(0o644)
+    return target
 
 
 def test_extract_markdown_entries_promotes_heading_context():
@@ -731,10 +755,11 @@ def test_cron_store_is_archived_without_config_cron_section(tmp_path: Path):
     assert "archive/cron-config.json" not in notes_text
 
 
-def test_skill_installs_cleanly_under_skills_guard():
+def test_skill_installs_cleanly_under_skills_guard(tmp_path: Path):
     skills_guard = load_skills_guard()
+    skill_dir = _copy_skill_tree_for_scan(tmp_path)
     result = skills_guard.scan_skill(
-        SCRIPT_PATH.parents[1],
+        skill_dir,
         source="official/migration/openclaw-migration",
     )
 
