@@ -29,6 +29,7 @@ the bridge forwards responses correctly into the inner SDK generator.
 from __future__ import annotations
 
 import pytest
+from unittest.mock import AsyncMock
 
 
 pytest.importorskip("mcp.client.auth.oauth2", reason="MCP SDK 1.26.0+ required")
@@ -92,6 +93,7 @@ async def test_hermes_provider_forwards_asend_values(tmp_path, monkeypatch):
         redirect_handler=_noop_redirect,
         callback_handler=_noop_callback,
     )
+    provider._prefetch_oauth_metadata = AsyncMock()
 
     req = httpx.Request("POST", "https://example.com/mcp")
     flow = provider.async_auth_flow(req)
@@ -168,6 +170,7 @@ async def test_hermes_provider_forwards_401_triggers_refresh(tmp_path, monkeypat
         redirect_handler=_noop_redirect,
         callback_handler=_noop_callback,
     )
+    provider._prefetch_oauth_metadata = AsyncMock()
 
     req = httpx.Request("POST", "https://example.com/mcp")
     flow = provider.async_auth_flow(req)

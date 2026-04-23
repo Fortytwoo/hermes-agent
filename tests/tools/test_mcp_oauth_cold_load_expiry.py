@@ -36,6 +36,7 @@ from __future__ import annotations
 import asyncio
 import json
 import time
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -268,6 +269,7 @@ async def test_initialize_seeds_token_expiry_time_from_stored_tokens(
         redirect_handler=_noop_redirect,
         callback_handler=_noop_callback,
     )
+    provider._prefetch_oauth_metadata = AsyncMock()
 
     await provider._initialize()
 
@@ -338,6 +340,7 @@ async def test_initialize_flags_expired_token_as_invalid(tmp_path, monkeypatch):
         redirect_handler=_noop_redirect,
         callback_handler=_noop_callback,
     )
+    provider._prefetch_oauth_metadata = AsyncMock()
 
     await provider._initialize()
 
