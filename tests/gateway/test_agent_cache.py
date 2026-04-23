@@ -133,6 +133,18 @@ class TestAgentCacheLifecycle:
         assert agent.enterprise_scope == enterprise_scope
         assert agent.session_address == session_address
 
+    def test_agent_constructor_preserves_user_id_for_scoped_memory(self):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            model="anthropic/claude-sonnet-4", api_key="test",
+            base_url="https://openrouter.ai/api/v1", provider="openrouter",
+            max_iterations=5, quiet_mode=True, skip_context_files=True,
+            skip_memory=True, platform="telegram", user_id="alice",
+        )
+
+        assert agent._user_id == "alice"
+
     def test_cache_hit_returns_same_agent(self):
         """Second message with same config reuses the cached agent instance."""
         from run_agent import AIAgent
