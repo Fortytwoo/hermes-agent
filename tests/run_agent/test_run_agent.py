@@ -17,6 +17,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from agent.scope import EnterpriseScope
 import run_agent
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
@@ -1713,6 +1714,27 @@ class TestConcurrentToolExecution:
                 skip_pre_tool_call_hook=True,
             )
             assert result == "result"
+
+    def test_invoke_tool_passes_enterprise_scope_to_session_search(self, agent):
+        agent._session_db = object()
+        agent.enterprise_scope = EnterpriseScope(
+            tenant_id="acme",
+            workspace_id="ops",
+            agent_id="planner",
+        )
+
+        with patch("tools.session_search_tool.session_search", return_value='{"success": true}') as mock_search:
+            result = agent._invoke_tool("session_search", {"query": "deploy"}, "task-1")
+
+        assert json.loads(result)["success"] is True
+        mock_search.assert_called_once_with(
+            query="deploy",
+            role_filter=None,
+            limit=3,
+            db=agent._session_db,
+            current_session_id=agent.session_id,
+            enterprise_scope=agent.enterprise_scope,
+        )
 
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")
