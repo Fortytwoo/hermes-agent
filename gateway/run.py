@@ -31,6 +31,7 @@ from datetime import datetime
 from typing import Dict, Optional, Any, List
 
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
+from agent.memory_backend import MemoryBackend
 
 # --- Agent cache tuning ---------------------------------------------------
 # Bounds the per-session AIAgent cache to prevent unbounded growth in
@@ -274,6 +275,8 @@ from gateway.config import (
     GatewayConfig,
     load_gateway_config,
 )
+from agent.scope import parse_scoped_session_key
+from agent.scope_resolver import resolve_enterprise_scope, resolve_session_address
 from gateway.session import (
     SessionStore,
     SessionSource,
@@ -295,6 +298,7 @@ from gateway.restart import (
     GATEWAY_SERVICE_RESTART_EXIT_CODE,
     parse_restart_drain_timeout,
 )
+from gateway.run_queue import GatewayRunQueue
 
 
 def _normalize_whatsapp_identifier(value: str) -> str:
@@ -541,19 +545,8 @@ def _resolve_hermes_bin() -> Optional[list[str]]:
     return None
 
 
-def _parse_session_key(session_key: str) -> "dict | None":
-    """Parse a session key into its component parts.
-
-    Session keys follow the format
-    ``agent:main:{platform}:{chat_type}:{chat_id}[:{extra}...]``.
-    Returns a dict with ``platform``, ``chat_type``, ``chat_id``, and
-    optionally ``thread_id`` keys, or None if the key doesn't match.
-
-    The 6th element is only returned as ``thread_id`` for chat types where
-    it is unambiguous (``dm`` and ``thread``).  For group/channel sessions
-    the suffix may be a user_id (per-user isolation) rather than a
-    thread_id, so we leave ``thread_id`` out to avoid mis-routing.
-    """
+def _parse_legacy_session_key(session_key: str) -> "dict | None":
+    """Parse the legacy ``agent:main:...`` session-key format."""
     parts = session_key.split(":")
     if len(parts) >= 5 and parts[0] == "agent" and parts[1] == "main":
         result = {
@@ -565,6 +558,22 @@ def _parse_session_key(session_key: str) -> "dict | None":
             result["thread_id"] = parts[5]
         return result
     return None
+
+
+def _parse_session_key(session_key: str) -> "dict | None":
+    """Parse legacy or scoped session keys into the legacy routing dict shape."""
+    scoped = parse_scoped_session_key(session_key)
+    if scoped:
+        _, session_address = scoped
+        result = {
+            "platform": session_address.platform,
+            "chat_type": session_address.chat_type,
+            "chat_id": session_address.chat_id,
+        }
+        if session_address.thread_id:
+            result["thread_id"] = session_address.thread_id
+        return result
+    return _parse_legacy_session_key(session_key)
 
 
 def _format_gateway_process_notification(evt: dict) -> "str | None":
@@ -652,14 +661,14 @@ class GatewayRunner:
         self._restart_detached = False
         self._restart_via_service = False
         self._stop_task: Optional[asyncio.Task] = None
-        
-        # Track running agents per session for interrupt support
-        # Key: session_key, Value: AIAgent instance
-        self._running_agents: Dict[str, Any] = {}
-        self._running_agents_ts: Dict[str, float] = {}  # start timestamp per session
-        self._pending_messages: Dict[str, str] = {}  # Queued messages during interrupt
-        self._busy_ack_ts: Dict[str, float] = {}  # last busy-ack timestamp per session (debounce)
-        self._session_run_generation: Dict[str, int] = {}
+
+        self._run_queue = GatewayRunQueue()
+        self._session_actors = self._run_queue.actors
+        self._running_agents = self._run_queue.running_agents
+        self._running_agents_ts = self._run_queue.running_agents_ts
+        self._pending_messages = self._run_queue.pending_messages
+        self._busy_ack_ts = self._run_queue.busy_ack_ts
+        self._session_run_generation = self._run_queue.run_generations
 
         # Cache AIAgent instances per session to preserve prompt caching.
         # Without this, a new AIAgent is created per message, rebuilding the
@@ -680,7 +689,7 @@ class GatewayRunner:
         self._session_model_overrides: Dict[str, Dict[str, str]] = {}
         # Track pending exec approvals per session
         # Key: session_key, Value: {"command": str, "pattern_key": str, ...}
-        self._pending_approvals: Dict[str, Dict[str, Any]] = {}
+        self._pending_approvals = self._run_queue.pending_approvals
 
         # Track platforms that failed to connect for background reconnection.
         # Key: Platform enum, Value: {"config": platform_config, "attempts": int, "next_retry": float}
@@ -688,7 +697,7 @@ class GatewayRunner:
 
         # Track pending /update prompt responses per session.
         # Key: session_key, Value: True when a prompt is waiting for user input.
-        self._update_prompt_pending: Dict[str, bool] = {}
+        self._update_prompt_pending = self._run_queue.update_prompt_pending
 
         # Persistent Honcho managers keyed by gateway session key.
         # This preserves write_frequency="session" semantics across short-lived
@@ -897,6 +906,12 @@ class GatewayRunner:
                 return
 
             from run_agent import AIAgent
+            parsed_scope = parse_scoped_session_key(session_key) if session_key else None
+            if parsed_scope is not None:
+                enterprise_scope, session_address = parsed_scope
+            else:
+                enterprise_scope, session_address = None, None
+            scoped_user_id = getattr(session_address, "user_id", "") if session_address else ""
             model, runtime_kwargs = self._resolve_session_agent_runtime(
                 session_key=session_key,
             )
@@ -911,6 +926,9 @@ class GatewayRunner:
                 skip_memory=True,  # Flush agent — no memory provider
                 enabled_toolsets=["memory", "skills"],
                 session_id=old_session_id,
+                user_id=scoped_user_id,
+                enterprise_scope=enterprise_scope,
+                session_address=session_address,
             )
             try:
                 # Fully silence the flush agent — quiet_mode only suppresses init
@@ -929,13 +947,17 @@ class GatewayRunner:
                 # what's already saved and avoid overwriting newer entries.
                 _current_memory = ""
                 try:
-                    from tools.memory_tool import get_memory_dir
-                    _mem_dir = get_memory_dir()
+                    _backend = MemoryBackend(get_hermes_home() / "memories")
                     for fname, label in [
                         ("MEMORY.md", "MEMORY (your personal notes)"),
                         ("USER.md", "USER PROFILE (who the user is)"),
                     ]:
-                        fpath = _mem_dir / fname
+                        target = "user" if fname == "USER.md" else "memory"
+                        fpath = _backend.path_for(
+                            target,
+                            scope=enterprise_scope,
+                            user_id=scoped_user_id,
+                        )
                         if fpath.exists():
                             content = fpath.read_text(encoding="utf-8").strip()
                             if content:
@@ -1219,6 +1241,9 @@ class GatewayRunner:
         self._shutdown_event.set()
 
     def _running_agent_count(self) -> int:
+        run_queue = getattr(self, "_run_queue", None)
+        if run_queue is not None and getattr(self, "_running_agents", None) is run_queue.running_agents:
+            return run_queue.running_count()
         return len(self._running_agents)
 
     def _status_action_label(self) -> str:
@@ -1498,6 +1523,9 @@ class GatewayRunner:
         return None
 
     def _snapshot_running_agents(self) -> Dict[str, Any]:
+        run_queue = getattr(self, "_run_queue", None)
+        if run_queue is not None and getattr(self, "_running_agents", None) is run_queue.running_agents:
+            return run_queue.snapshot_running_agents(_AGENT_PENDING_SENTINEL)
         return {
             session_key: agent
             for session_key, agent in self._running_agents.items()
@@ -1608,6 +1636,13 @@ class GatewayRunner:
         return True
 
     async def _drain_active_agents(self, timeout: float) -> tuple[Dict[str, Any], bool]:
+        run_queue = getattr(self, "_run_queue", None)
+        if run_queue is not None and getattr(self, "_running_agents", None) is run_queue.running_agents:
+            return await run_queue.drain_active(
+                timeout=timeout,
+                update_status=lambda: self._update_runtime_status("draining"),
+                pending_sentinel=_AGENT_PENDING_SENTINEL,
+            )
         snapshot = self._snapshot_running_agents()
         last_active_count = self._running_agent_count()
         last_status_at = 0.0
@@ -1638,6 +1673,16 @@ class GatewayRunner:
         return snapshot, timed_out
 
     def _interrupt_running_agents(self, reason: str) -> None:
+        run_queue = getattr(self, "_run_queue", None)
+        if run_queue is not None and getattr(self, "_running_agents", None) is run_queue.running_agents:
+            try:
+                run_queue.interrupt_running_agents(
+                    reason,
+                    pending_sentinel=_AGENT_PENDING_SENTINEL,
+                )
+                return
+            except Exception as e:
+                logger.debug("Failed interrupting agent during shutdown: %s", e)
         for session_key, agent in list(self._running_agents.items()):
             if agent is _AGENT_PENDING_SENTINEL:
                 continue
@@ -2628,12 +2673,26 @@ class GatewayRunner:
             self._background_tasks.clear()
 
             self.adapters.clear()
-            self._running_agents.clear()
-            self._running_agents_ts.clear()
-            self._pending_messages.clear()
-            self._pending_approvals.clear()
-            if hasattr(self, '_busy_ack_ts'):
-                self._busy_ack_ts.clear()
+            run_queue = getattr(self, "_run_queue", None)
+            if run_queue is not None:
+                run_queue.clear_all_runtime_state()
+                if getattr(self, "_running_agents", None) is not run_queue.running_agents:
+                    self._running_agents.clear()
+                if getattr(self, "_running_agents_ts", None) is not run_queue.running_agents_ts:
+                    self._running_agents_ts.clear()
+                if getattr(self, "_pending_messages", None) is not run_queue.pending_messages:
+                    self._pending_messages.clear()
+                if getattr(self, "_pending_approvals", None) is not run_queue.pending_approvals:
+                    self._pending_approvals.clear()
+                if getattr(self, "_busy_ack_ts", None) is not run_queue.busy_ack_ts and hasattr(self, "_busy_ack_ts"):
+                    self._busy_ack_ts.clear()
+            else:
+                self._running_agents.clear()
+                self._running_agents_ts.clear()
+                self._pending_messages.clear()
+                self._pending_approvals.clear()
+                if hasattr(self, "_busy_ack_ts"):
+                    self._busy_ack_ts.clear()
             self._shutdown_event.set()
 
             # Global cleanup: kill any remaining tool subprocesses not tied
@@ -3538,6 +3597,7 @@ class GatewayRunner:
                     "/plan",
                     user_instruction,
                     task_id=_quick_key,
+                    platform=source.platform.value if source.platform else None,
                     runtime_note=(
                         "Save the markdown plan with write_file to this exact relative path "
                         f"inside the active workspace/backend cwd: {plan_path}"
@@ -3692,13 +3752,13 @@ class GatewayRunner:
                     build_skill_invocation_message,
                     resolve_skill_command_key,
                 )
-                skill_cmds = get_skill_commands()
-                cmd_key = resolve_skill_command_key(command)
+                _platform_name = source.platform.value if source.platform else None
+                skill_cmds = get_skill_commands(platform=_platform_name)
+                cmd_key = resolve_skill_command_key(command, platform=_platform_name)
                 if cmd_key is not None:
-                    # Check per-platform disabled status before executing.
-                    # get_skill_commands() only applies the *global* disabled
-                    # list at scan time; per-platform overrides need checking
-                    # here because the cache is process-global across platforms.
+                    # Re-check platform-specific disabled status at dispatch
+                    # time so direct command execution stays aligned with the
+                    # current gateway surface.
                     _skill_name = skill_cmds[cmd_key].get("name", "")
                     _plat = source.platform.value if source.platform else None
                     if _plat and _skill_name:
@@ -3710,7 +3770,10 @@ class GatewayRunner:
                             )
                     user_instruction = event.get_command_args().strip()
                     msg = build_skill_invocation_message(
-                        cmd_key, user_instruction, task_id=_quick_key
+                        cmd_key,
+                        user_instruction,
+                        task_id=_quick_key,
+                        platform=_platform_name,
                     )
                     if msg:
                         event.text = msg
@@ -4274,6 +4337,8 @@ class GatewayRunner:
                                     skip_memory=True,
                                     enabled_toolsets=["memory"],
                                     session_id=session_entry.session_id,
+                                    enterprise_scope=session_entry.enterprise_scope,
+                                    session_address=session_entry.session_address,
                                 )
                                 try:
                                     _hyg_agent._print_fn = lambda *a, **kw: None
@@ -4413,6 +4478,7 @@ class GatewayRunner:
                 source=source,
                 session_id=session_entry.session_id,
                 session_key=session_key,
+                session_entry=session_entry,
                 run_generation=run_generation,
                 event_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
@@ -5272,7 +5338,9 @@ class GatewayRunner:
         ]
         try:
             from agent.skill_commands import get_skill_commands
-            skill_cmds = get_skill_commands()
+            skill_cmds = get_skill_commands(
+                platform=event.source.platform.value if event.source.platform else None
+            )
             if skill_cmds:
                 lines.append(f"\n⚡ **Skill Commands** ({len(skill_cmds)} active):")
                 # Show first 10, then point to /commands for the rest
@@ -5302,7 +5370,9 @@ class GatewayRunner:
         entries = list(gateway_help_lines())
         try:
             from agent.skill_commands import get_skill_commands
-            skill_cmds = get_skill_commands()
+            skill_cmds = get_skill_commands(
+                platform=event.source.platform.value if event.source.platform else None
+            )
             if skill_cmds:
                 entries.append("")
                 entries.append("⚡ **Skill Commands**:")
@@ -6456,6 +6526,8 @@ class GatewayRunner:
                     session_id=task_id,
                     platform=platform_key,
                     user_id=source.user_id,
+                    enterprise_scope=resolve_enterprise_scope(),
+                    session_address=resolve_session_address(source),
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
@@ -6637,6 +6709,8 @@ class GatewayRunner:
                     provider_data_collection=pr.get("data_collection"),
                     session_id=task_id,
                     platform=platform_key,
+                    enterprise_scope=session_entry.enterprise_scope,
+                    session_address=session_entry.session_address,
                     session_db=None,
                     fallback_model=self._fallback_model,
                     skip_memory=True,
@@ -6978,6 +7052,8 @@ class GatewayRunner:
                 skip_memory=True,
                 enabled_toolsets=["memory"],
                 session_id=session_entry.session_id,
+                enterprise_scope=session_entry.enterprise_scope,
+                session_address=session_entry.session_address,
             )
             try:
                 tmp_agent._print_fn = lambda *a, **kw: None
@@ -8276,6 +8352,8 @@ class GatewayRunner:
         derived_platform = ""
         derived_chat_type = ""
         derived_chat_id = ""
+        derived_thread_id = ""
+        derived_user_id = ""
 
         if session_key:
             try:
@@ -8295,6 +8373,13 @@ class GatewayRunner:
                 derived_platform = _parsed["platform"]
                 derived_chat_type = _parsed["chat_type"]
                 derived_chat_id = _parsed["chat_id"]
+                derived_thread_id = _parsed.get("thread_id") or ""
+
+            _scoped = parse_scoped_session_key(session_key)
+            if _scoped:
+                _, _address = _scoped
+                derived_thread_id = _address.thread_id or derived_thread_id
+                derived_user_id = _address.user_id or derived_user_id
 
         platform_name = str(evt.get("platform") or derived_platform or "").strip().lower()
         chat_type = str(evt.get("chat_type") or derived_chat_type or "").strip().lower()
@@ -8315,8 +8400,8 @@ class GatewayRunner:
             platform=platform,
             chat_id=chat_id,
             chat_type=chat_type,
-            thread_id=str(evt.get("thread_id") or "").strip() or None,
-            user_id=str(evt.get("user_id") or "").strip() or None,
+            thread_id=str(evt.get("thread_id") or derived_thread_id or "").strip() or None,
+            user_id=str(evt.get("user_id") or derived_user_id or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
         )
 
@@ -8598,6 +8683,10 @@ class GatewayRunner:
         """
         if not session_key:
             return
+        run_queue = getattr(self, "_run_queue", None)
+        if run_queue is not None and getattr(self, "_running_agents", None) is run_queue.running_agents:
+            run_queue.release_running_state(session_key)
+            return
         self._running_agents.pop(session_key, None)
         self._running_agents_ts.pop(session_key, None)
         if hasattr(self, "_busy_ack_ts"):
@@ -8613,6 +8702,9 @@ class GatewayRunner:
         """
         if not session_key:
             return 0
+        run_queue = getattr(self, "_run_queue", None)
+        if run_queue is not None:
+            return run_queue.begin_run_generation(session_key)
         generations = self.__dict__.get("_session_run_generation")
         if generations is None:
             generations = {}
@@ -8637,6 +8729,9 @@ class GatewayRunner:
         """Return True when ``generation`` is still current for ``session_key``."""
         if not session_key:
             return True
+        run_queue = getattr(self, "_run_queue", None)
+        if run_queue is not None:
+            return run_queue.is_run_generation_current(session_key, generation)
         generations = self.__dict__.get("_session_run_generation") or {}
         return int(generations.get(session_key, 0)) == int(generation)
 
@@ -9138,6 +9233,7 @@ class GatewayRunner:
         source: SessionSource,
         session_id: str,
         session_key: str = None,
+        session_entry=None,
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
@@ -9178,6 +9274,12 @@ class GatewayRunner:
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
+
+        if session_entry is None and getattr(self, "session_store", None) is not None:
+            try:
+                session_entry = self.session_store.get_or_create_session(source)
+            except Exception:
+                session_entry = None
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
@@ -9699,6 +9801,8 @@ class GatewayRunner:
                     platform=platform_key,
                     user_id=source.user_id,
                     gateway_session_key=session_key,
+                    enterprise_scope=getattr(session_entry, "enterprise_scope", None),
+                    session_address=getattr(session_entry, "session_address", None),
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
@@ -10618,6 +10722,7 @@ class GatewayRunner:
                     source=next_source,
                     session_id=session_id,
                     session_key=session_key,
+                    session_entry=session_entry,
                     run_generation=run_generation,
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,

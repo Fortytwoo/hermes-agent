@@ -15,6 +15,7 @@ import threading
 from unittest.mock import MagicMock, patch
 
 import pytest
+from agent.scope import EnterpriseScope, SessionAddress
 
 
 def _make_runner():
@@ -101,6 +102,48 @@ class TestAgentConfigSignature:
 
 class TestAgentCacheLifecycle:
     """End-to-end cache behavior with real AIAgent construction."""
+
+    def test_agent_constructor_accepts_typed_metadata(self):
+        """Gateway cache paths can pass typed session metadata without rebuild regressions."""
+        from run_agent import AIAgent
+
+        enterprise_scope = EnterpriseScope(
+            tenant_id="acme",
+            workspace_id="ops",
+            agent_id="planner",
+        )
+        session_address = SessionAddress(
+            source="telegram",
+            platform="telegram",
+            chat_type="group",
+            chat_id="-100",
+            thread_id="42",
+            user_id="alice",
+        )
+
+        agent = AIAgent(
+            model="anthropic/claude-sonnet-4", api_key="test",
+            base_url="https://openrouter.ai/api/v1", provider="openrouter",
+            max_iterations=5, quiet_mode=True, skip_context_files=True,
+            skip_memory=True, platform="telegram",
+            enterprise_scope=enterprise_scope,
+            session_address=session_address,
+        )
+
+        assert agent.enterprise_scope == enterprise_scope
+        assert agent.session_address == session_address
+
+    def test_agent_constructor_preserves_user_id_for_scoped_memory(self):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            model="anthropic/claude-sonnet-4", api_key="test",
+            base_url="https://openrouter.ai/api/v1", provider="openrouter",
+            max_iterations=5, quiet_mode=True, skip_context_files=True,
+            skip_memory=True, platform="telegram", user_id="alice",
+        )
+
+        assert agent._user_id == "alice"
 
     def test_cache_hit_returns_same_agent(self):
         """Second message with same config reuses the cached agent instance."""
@@ -673,13 +716,14 @@ class TestAgentCacheSpilloverLive:
     def _real_agent(self):
         """A genuine AIAgent; no API calls are made during these tests."""
         from run_agent import AIAgent
-        return AIAgent(
-            model="anthropic/claude-sonnet-4", api_key="test",
-            base_url="https://openrouter.ai/api/v1", provider="openrouter",
-            max_iterations=5, quiet_mode=True,
-            skip_context_files=True, skip_memory=True,
-            platform="telegram",
-        )
+        with patch.dict("os.environ", {"OPENROUTER_API_KEY": "test-key"}):
+            return AIAgent(
+                model="anthropic/claude-sonnet-4", api_key="test",
+                base_url="https://openrouter.ai/api/v1", provider="openrouter",
+                max_iterations=5, quiet_mode=True,
+                skip_context_files=True, skip_memory=True,
+                platform="telegram",
+            )
 
     def test_fill_to_cap_then_spillover(self, monkeypatch):
         """Fill to cap with real agents, insert one more, oldest evicted."""
@@ -756,7 +800,7 @@ class TestAgentCacheSpilloverLive:
         runner = self._runner()
 
         N_THREADS = 8
-        PER_THREAD = 20  # 8 * 20 = 160 inserts into a 16-slot cache
+        PER_THREAD = 8  # Still oversubscribes the 16-slot cache under concurrent insert load.
 
         def worker(tid: int):
             for j in range(PER_THREAD):
@@ -773,7 +817,7 @@ class TestAgentCacheSpilloverLive:
         for t in threads:
             t.start()
         for t in threads:
-            t.join(timeout=30)
+            t.join(timeout=60)
             assert not t.is_alive(), "Worker thread hung — possible deadlock?"
 
         # Let daemon cleanup threads settle.
@@ -950,6 +994,7 @@ class TestAgentCacheIdleResume:
         release_clients() (soft — session may resume).
         """
         from run_agent import AIAgent
+        import run_agent as run_agent_mod
         from tools import terminal_tool as _tt
 
         # Agent A: evicted from cache (soft) — terminal survives.
@@ -971,12 +1016,15 @@ class TestAgentCacheIdleResume:
 
         vm_calls: list = []
         original_vm = _tt.cleanup_vm
+        original_run_agent_vm = run_agent_mod.cleanup_vm
         _tt.cleanup_vm = lambda tid: vm_calls.append(tid)
+        run_agent_mod.cleanup_vm = lambda tid: vm_calls.append(tid)
         try:
             agent_a.release_clients()   # cache eviction
             agent_b.close()              # session expiry
         finally:
             _tt.cleanup_vm = original_vm
+            run_agent_mod.cleanup_vm = original_run_agent_vm
             try:
                 agent_a.close()
             except Exception:

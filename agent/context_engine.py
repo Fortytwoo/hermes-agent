@@ -146,6 +146,14 @@ class ContextEngine(ABC):
         import json
         return json.dumps({"error": f"Unknown context engine tool: {name}"})
 
+    def build_context_pack(self, **kwargs):
+        """Return an optional runtime context pack for the current session."""
+        return None
+
+    def resolve_tool_policy(self, **kwargs):
+        """Return an optional runtime tool policy for the current session."""
+        return None
+
     # -- Optional: status / display ----------------------------------------
 
     def get_status(self) -> Dict[str, Any]:

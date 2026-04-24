@@ -215,7 +215,7 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
 
 
 @pytest.fixture(autouse=True)
-def _hermetic_environment(tmp_path, monkeypatch):
+def _hermetic_environment(request, tmp_path, monkeypatch):
     """Blank out all credential/behavioral env vars so local and CI match.
 
     Also redirects HOME and HERMES_HOME to per-test tempdirs so code that
@@ -230,6 +230,25 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # 2. Blank behavioral HERMES_* vars that could change test semantics.
     for name in _HERMES_BEHAVIORAL_VARS:
         monkeypatch.delenv(name, raising=False)
+
+    # 2b. Blank terminal backend env for hermetic non-integration tests.
+    # Some tested code paths (notably Atropos env bootstrap) assign
+    # os.environ["TERMINAL_ENV"] directly instead of going through
+    # monkeypatch, so a worker can inherit a prior test's backend
+    # selection (for example "modal") and silently drop terminal/file
+    # tools in unrelated later tests. Preserve external terminal env for
+    # integration/e2e tests, which may intentionally exercise real
+    # backends from the surrounding shell.
+    preserve_terminal_env = (
+        request.node.get_closest_marker("integration") is not None
+        or request.node.get_closest_marker("e2e") is not None
+        or request.node.nodeid.startswith("tests/integration/")
+        or request.node.nodeid.startswith("tests/e2e/")
+    )
+    if not preserve_terminal_env:
+        for name in list(os.environ.keys()):
+            if name.startswith("TERMINAL_"):
+                monkeypatch.delenv(name, raising=False)
 
     # 3. Redirect HERMES_HOME to a per-test tempdir. Code that reads
     #    ``~/.hermes/*`` via ``get_hermes_home()`` now gets the tempdir.
@@ -378,6 +397,22 @@ def _reset_module_state():
             _ft_mod._read_tracker.clear()
         with _ft_mod._file_ops_lock:
             _ft_mod._file_ops_cache.clear()
+    except Exception:
+        pass
+
+    # --- tools.terminal_tool — backend selection + sandbox registry ---
+    # These module globals persist per xdist worker. Clear task-local
+    # overrides and cached env instances so a prior test's backend choice
+    # cannot influence later tests that expect the default local backend.
+    try:
+        from tools import terminal_tool as _tt_mod
+        _tt_mod._cached_sudo_password = ""
+        _tt_mod._task_env_overrides.clear()
+        with _tt_mod._env_lock:
+            _tt_mod._active_environments.clear()
+            _tt_mod._last_activity.clear()
+        with _tt_mod._creation_locks_lock:
+            _tt_mod._creation_locks.clear()
     except Exception:
         pass
 

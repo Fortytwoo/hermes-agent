@@ -17,6 +17,8 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
+from agent.tool_policy import ToolPolicy
+from agent.scope import EnterpriseScope, SessionAddress
 from tools.delegate_tool import (
     DELEGATE_BLOCKED_TOOLS,
     DELEGATE_TASK_SCHEMA,
@@ -44,6 +46,20 @@ def _make_mock_parent(depth=0):
     parent.api_mode = "chat_completions"
     parent.model = "anthropic/claude-sonnet-4"
     parent.platform = "cli"
+    parent._user_id = "alice"
+    parent._gateway_session_key = "agent:scope:v1:tenant:acme:workspace:ops:agent:planner:platform:telegram:chat_type:dm:chat:123:user:alice"
+    parent.enterprise_scope = EnterpriseScope(
+        tenant_id="acme",
+        workspace_id="ops",
+        agent_id="planner",
+    )
+    parent.session_address = SessionAddress(
+        source="telegram",
+        platform="telegram",
+        chat_type="dm",
+        chat_id="123",
+        user_id="alice",
+    )
     parent.providers_allowed = None
     parent.providers_ignored = None
     parent.providers_order = None
@@ -55,6 +71,7 @@ def _make_mock_parent(depth=0):
     parent._print_fn = None
     parent.tool_progress_callback = None
     parent.thinking_callback = None
+    parent.tool_policy = None
     return parent
 
 
@@ -260,6 +277,26 @@ class TestDelegateTask(unittest.TestCase):
             self.assertEqual(kwargs["provider"], parent.provider)
             self.assertEqual(kwargs["api_mode"], parent.api_mode)
 
+    def test_child_inherits_scoped_memory_identity(self):
+        parent = _make_mock_parent(depth=0)
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            mock_child.run_conversation.return_value = {
+                "final_response": "ok",
+                "completed": True,
+                "api_calls": 1,
+            }
+            MockAgent.return_value = mock_child
+
+            delegate_task(goal="Test scoped memory inheritance", parent_agent=parent)
+
+            _, kwargs = MockAgent.call_args
+            self.assertEqual(kwargs["user_id"], "alice")
+            self.assertEqual(kwargs["gateway_session_key"], parent._gateway_session_key)
+            self.assertEqual(kwargs["enterprise_scope"], parent.enterprise_scope)
+            self.assertEqual(kwargs["session_address"], parent.session_address)
+
     def test_child_inherits_parent_print_fn(self):
         parent = _make_mock_parent(depth=0)
         sink = MagicMock()
@@ -304,6 +341,30 @@ class TestDelegateTask(unittest.TestCase):
         self.assertTrue(callable(mock_child.thinking_callback))
         mock_child.thinking_callback("deliberating...")
         parent.tool_progress_callback.assert_not_called()
+
+    def test_child_inherits_parent_tool_policy(self):
+        parent = _make_mock_parent(depth=0)
+        parent.tool_policy = ToolPolicy(
+            visible_tool_names={"read_file", "write_file"},
+            authorized_tool_names={"read_file"},
+        )
+
+        with patch("run_agent.AIAgent") as MockAgent:
+            mock_child = MagicMock()
+            MockAgent.return_value = mock_child
+
+            _build_child_agent(
+                task_index=0,
+                goal="Keep tool auth boundary",
+                context=None,
+                toolsets=None,
+                model=None,
+                max_iterations=10,
+                parent_agent=parent,
+                task_count=1,
+            )
+
+        self.assertIs(MockAgent.call_args[1]["tool_policy"], parent.tool_policy)
 
 
 class TestToolNamePreservation(unittest.TestCase):

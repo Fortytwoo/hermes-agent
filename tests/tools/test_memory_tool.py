@@ -4,6 +4,8 @@ import json
 import pytest
 from pathlib import Path
 
+from agent.memory_backend import MemoryBackend
+from agent.scope import EnterpriseScope
 from tools.memory_tool import (
     MemoryStore,
     memory_tool,
@@ -206,6 +208,86 @@ class TestMemoryStorePersistence:
         store = MemoryStore()
         store.load_from_disk()
         assert len(store.memory_entries) == 2
+
+    def test_scoped_roundtrip_uses_scoped_backend(self, tmp_path):
+        backend = MemoryBackend(tmp_path)
+        scope = EnterpriseScope(tenant_id="acme", workspace_id="ops", agent_id="planner")
+
+        store1 = MemoryStore(
+            memory_char_limit=500,
+            user_char_limit=300,
+            enterprise_scope=scope,
+            user_id="alice",
+            backend=backend,
+        )
+        store1.load_from_disk()
+        store1.add("memory", "scoped fact")
+        store1.add("user", "Alice likes terse output")
+
+        assert not (tmp_path / "MEMORY.md").exists()
+        assert not (tmp_path / "USER.md").exists()
+        assert store1._path_for("memory").exists()
+        assert store1._path_for("user").exists()
+
+        store2 = MemoryStore(
+            memory_char_limit=500,
+            user_char_limit=300,
+            enterprise_scope=scope,
+            user_id="alice",
+            backend=backend,
+        )
+        store2.load_from_disk()
+        assert "scoped fact" in store2.memory_entries
+        assert "Alice likes terse output" in store2.user_entries
+
+
+class TestScopedPathResolution:
+    def test_legacy_no_scope_falls_back_to_profile_root(self, tmp_path):
+        store = MemoryStore(
+            memory_char_limit=500,
+            user_char_limit=300,
+            enterprise_scope=EnterpriseScope(),
+            user_id="",
+            backend=MemoryBackend(tmp_path),
+        )
+
+        assert store._path_for("memory") == tmp_path / "MEMORY.md"
+        assert store._path_for("user") == tmp_path / "USER.md"
+
+    def test_scoped_user_target_requires_user_bucket(self, tmp_path):
+        scope = EnterpriseScope(tenant_id="acme", workspace_id="ops", agent_id="planner")
+        store = MemoryStore(
+            memory_char_limit=500,
+            user_char_limit=300,
+            enterprise_scope=scope,
+            user_id="alice:ops",
+            backend=MemoryBackend(tmp_path),
+        )
+
+        memory_path = store._path_for("memory")
+        user_path = store._path_for("user")
+
+        assert memory_path != tmp_path / "MEMORY.md"
+        assert user_path != tmp_path / "USER.md"
+        assert memory_path.name == "MEMORY.md"
+        assert user_path.name == "USER.md"
+        assert "scoped" in memory_path.parts
+        assert "users" in user_path.parts
+        assert user_path.parts[-2] != "alice:ops"
+        assert ":" not in user_path.parts[-2]
+
+    def test_scoped_user_without_user_id_keeps_legacy_user_file(self, tmp_path):
+        scope = EnterpriseScope(tenant_id="acme", workspace_id="ops", agent_id="planner")
+        store = MemoryStore(
+            memory_char_limit=500,
+            user_char_limit=300,
+            enterprise_scope=scope,
+            user_id="",
+            backend=MemoryBackend(tmp_path),
+        )
+
+        assert store._path_for("memory") != tmp_path / "MEMORY.md"
+        assert store._path_for("user") == tmp_path / "USER.md"
 
 
 class TestMemoryStoreSnapshot:

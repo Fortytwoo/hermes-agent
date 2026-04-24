@@ -5,9 +5,11 @@ from unittest.mock import call, patch
 
 import pytest
 
+from agent.tool_policy import ToolPolicy
 from model_tools import (
     handle_function_call,
     get_all_tool_names,
+    get_tool_definitions,
     get_toolset_for_tool,
     _AGENT_LOOP_TOOLS,
     _LEGACY_TOOLSET_MAP,
@@ -204,6 +206,42 @@ class TestLegacyToolsetMap:
             assert isinstance(tools, list), f"{name} is not a list"
             for tool in tools:
                 assert isinstance(tool, str), f"{name} contains non-string: {tool}"
+
+
+# =========================================================================
+# Tool policy filtering
+# =========================================================================
+
+class TestToolPolicyFiltering:
+    def test_visibility_filter_is_deterministic_and_separate_from_authorization(self):
+        policy = ToolPolicy(
+            visible_tool_names={"write_file", "read_file"},
+            authorized_tool_names={"read_file"},
+        )
+
+        defs = get_tool_definitions(
+            enabled_toolsets=["file"],
+            quiet_mode=True,
+            tool_policy=policy,
+        )
+
+        names = [tool["function"]["name"] for tool in defs]
+        assert names == ["read_file", "write_file"]
+
+    def test_default_policy_keeps_legacy_compatibility(self):
+        baseline = get_tool_definitions(
+            enabled_toolsets=["file"],
+            quiet_mode=True,
+        )
+        policy_filtered = get_tool_definitions(
+            enabled_toolsets=["file"],
+            quiet_mode=True,
+            tool_policy=ToolPolicy(),
+        )
+
+        assert [tool["function"]["name"] for tool in policy_filtered] == [
+            tool["function"]["name"] for tool in baseline
+        ]
 
 
 # =========================================================================

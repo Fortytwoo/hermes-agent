@@ -13,6 +13,9 @@ import pytest
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
+from agent.memory_backend import MemoryBackend
+from agent.scope import EnterpriseScope, SessionAddress
+
 
 @pytest.fixture(autouse=True)
 def _mock_dotenv(monkeypatch):
@@ -85,19 +88,32 @@ class TestMemoryInjection:
 
     def test_memory_content_injected_into_flush_prompt(self, tmp_path, monkeypatch):
         """When memory files exist, their content appears in the flush prompt."""
-        memory_dir = tmp_path / "memories"
-        memory_dir.mkdir()
-        (memory_dir / "MEMORY.md").write_text("Agent knows Python\n§\nUser prefers dark mode")
-        (memory_dir / "USER.md").write_text("Name: Alice\n§\nTimezone: PST")
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        backend = MemoryBackend(tmp_path / "memories")
+        scope = EnterpriseScope(tenant_id="acme", workspace_id="ops", agent_id="planner")
+        scoped_memory = backend.path_for("memory", scope=scope, user_id="alice")
+        scoped_user = backend.path_for("user", scope=scope, user_id="alice")
+        scoped_memory.parent.mkdir(parents=True, exist_ok=True)
+        scoped_user.parent.mkdir(parents=True, exist_ok=True)
+        scoped_memory.write_text("Agent knows Python\n§\nUser prefers dark mode", encoding="utf-8")
+        scoped_user.write_text("Name: Alice\n§\nTimezone: PST", encoding="utf-8")
 
-        runner, tmp_agent, _ = _make_flush_context(monkeypatch, memory_dir)
+        # Legacy files exist too, but scoped stale-guard must ignore them.
+        (tmp_path / "memories").mkdir(exist_ok=True)
+        (tmp_path / "memories" / "MEMORY.md").write_text("legacy memory", encoding="utf-8")
+        (tmp_path / "memories" / "USER.md").write_text("legacy user", encoding="utf-8")
+
+        runner, tmp_agent, _ = _make_flush_context(monkeypatch)
+        session_key = (
+            "agent:scope:v1:tenant:acme:workspace:ops:agent:planner:"
+            "platform:telegram:chat_type:dm:chat:123:user:alice"
+        )
 
         with (
             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "k"}),
             patch("gateway.run._resolve_gateway_model", return_value="test-model"),
-            patch.dict("sys.modules", {"tools.memory_tool": MagicMock(get_memory_dir=lambda: memory_dir)}),
         ):
-            runner._flush_memories_for_session("session_123")
+            runner._flush_memories_for_session("session_123", session_key=session_key)
 
         tmp_agent.run_conversation.assert_called_once()
         flush_prompt = tmp_agent.run_conversation.call_args.kwargs.get("user_message", "")
@@ -106,20 +122,21 @@ class TestMemoryInjection:
         assert "User prefers dark mode" in flush_prompt
         assert "Name: Alice" in flush_prompt
         assert "Timezone: PST" in flush_prompt
+        assert "legacy memory" not in flush_prompt
+        assert "legacy user" not in flush_prompt
         assert "Do NOT overwrite or remove entries" in flush_prompt
         assert "current live state of memory" in flush_prompt
 
     def test_flush_works_without_memory_files(self, tmp_path, monkeypatch):
         """When no memory files exist, flush still runs without the guard."""
-        empty_dir = tmp_path / "no_memories"
-        empty_dir.mkdir()
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        (tmp_path / "memories").mkdir()
 
         runner, tmp_agent, _ = _make_flush_context(monkeypatch)
 
         with (
             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "k"}),
             patch("gateway.run._resolve_gateway_model", return_value="test-model"),
-            patch.dict("sys.modules", {"tools.memory_tool": MagicMock(get_memory_dir=lambda: empty_dir)}),
         ):
             runner._flush_memories_for_session("session_456")
 
@@ -130,23 +147,61 @@ class TestMemoryInjection:
 
     def test_empty_memory_files_no_injection(self, tmp_path, monkeypatch):
         """Empty memory files should not trigger the guard section."""
-        memory_dir = tmp_path / "memories"
-        memory_dir.mkdir()
-        (memory_dir / "MEMORY.md").write_text("")
-        (memory_dir / "USER.md").write_text("  \n  ")  # whitespace only
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        backend = MemoryBackend(tmp_path / "memories")
+        scope = EnterpriseScope(tenant_id="acme", workspace_id="ops", agent_id="planner")
+        scoped_memory = backend.path_for("memory", scope=scope, user_id="alice")
+        scoped_user = backend.path_for("user", scope=scope, user_id="alice")
+        scoped_memory.parent.mkdir(parents=True, exist_ok=True)
+        scoped_user.parent.mkdir(parents=True, exist_ok=True)
+        scoped_memory.write_text("", encoding="utf-8")
+        scoped_user.write_text("  \n  ", encoding="utf-8")
 
         runner, tmp_agent, _ = _make_flush_context(monkeypatch)
+        session_key = (
+            "agent:scope:v1:tenant:acme:workspace:ops:agent:planner:"
+            "platform:telegram:chat_type:dm:chat:123:user:alice"
+        )
 
         with (
             patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "k"}),
             patch("gateway.run._resolve_gateway_model", return_value="test-model"),
-            patch.dict("sys.modules", {"tools.memory_tool": MagicMock(get_memory_dir=lambda: memory_dir)}),
         ):
-            runner._flush_memories_for_session("session_789")
+            runner._flush_memories_for_session("session_789", session_key=session_key)
 
         tmp_agent.run_conversation.assert_called_once()
         flush_prompt = tmp_agent.run_conversation.call_args.kwargs.get("user_message", "")
         assert "current live state of memory" not in flush_prompt
+
+    def test_flush_agent_inherits_scope_and_user_metadata(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        runner, tmp_agent, _ = _make_flush_context(monkeypatch)
+        session_key = (
+            "agent:scope:v1:tenant:acme:workspace:ops:agent:planner:"
+            "platform:telegram:chat_type:group:chat:-100:thread:42:user:alice"
+        )
+
+        with (
+            patch("gateway.run._resolve_runtime_agent_kwargs", return_value={"api_key": "k"}),
+            patch("gateway.run._resolve_gateway_model", return_value="test-model"),
+        ):
+            runner._flush_memories_for_session("session_scoped", session_key=session_key)
+
+        _, kwargs = sys.modules["run_agent"].AIAgent.call_args
+        assert kwargs["user_id"] == "alice"
+        assert kwargs["enterprise_scope"] == EnterpriseScope(
+            tenant_id="acme",
+            workspace_id="ops",
+            agent_id="planner",
+        )
+        assert kwargs["session_address"] == SessionAddress(
+            source="",
+            platform="telegram",
+            chat_type="group",
+            chat_id="-100",
+            thread_id="42",
+            user_id="alice",
+        )
 
 
 class TestFlushAgentSilenced:

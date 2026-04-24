@@ -762,8 +762,15 @@ def check_all_command_guards(command: str, env_type: str,
     # Only catch ImportError (module not installed).
     tirith_result = {"action": "allow", "findings": [], "summary": ""}
     try:
-        from tools.tirith_security import check_command_security
-        tirith_result = check_command_security(command)
+        from tools.tirith_security import check_command_security, ensure_installed
+        # Gateway / exec-ask flows must not block on tirith auto-install. Kick off
+        # the background installer and fail open until a local binary is ready.
+        if is_gateway or is_ask:
+            tirith_path = ensure_installed(log_failures=False)
+            if tirith_path:
+                tirith_result = check_command_security(command)
+        else:
+            tirith_result = check_command_security(command)
     except ImportError:
         pass  # tirith module not installed — allow
 

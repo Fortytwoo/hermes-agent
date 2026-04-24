@@ -10,6 +10,7 @@ import pytest
 import yaml
 
 import gateway.run as gateway_run
+from agent.scope import EnterpriseScope, SessionAddress
 from gateway.config import Platform
 from gateway.platforms.base import MessageEvent
 from gateway.session import SessionSource
@@ -176,3 +177,70 @@ async def test_run_agent_passes_priority_processing_to_gateway_agent(monkeypatch
     assert result["final_response"] == "ok"
     assert _CapturingAgent.last_init["service_tier"] == "priority"
     assert _CapturingAgent.last_init["request_overrides"] == {"service_tier": "priority"}
+
+
+@pytest.mark.asyncio
+async def test_run_agent_passes_session_boundaries_to_fresh_agent(monkeypatch, tmp_path):
+    _install_fake_agent(monkeypatch)
+    runner = _make_runner()
+
+    scope = EnterpriseScope(
+        tenant_id="tenant-a",
+        workspace_id="workspace-a",
+        agent_id="agent-a",
+    )
+    address = SessionAddress(
+        source="telegram",
+        platform="telegram",
+        chat_type="dm",
+        chat_id="12345",
+        thread_id="thread-1",
+        user_id="user-1",
+    )
+    runner.session_store = SimpleNamespace(
+        get_or_create_session=lambda source: SimpleNamespace(
+            session_id="session-1",
+            session_key="agent:agent-a:telegram:dm:12345",
+            enterprise_scope=scope,
+            session_address=address,
+            last_prompt_tokens=0,
+        ),
+        load_transcript=lambda session_id: [],
+        append_to_transcript=lambda *args, **kwargs: None,
+        update_session=lambda *args, **kwargs: None,
+        has_any_sessions=lambda: False,
+    )
+
+    (tmp_path / "config.yaml").write_text("", encoding="utf-8")
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(gateway_run, "_env_path", tmp_path / ".env")
+    monkeypatch.setattr(gateway_run, "load_dotenv", lambda *args, **kwargs: None)
+    monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+    monkeypatch.setattr(gateway_run, "_resolve_gateway_model", lambda config=None: "gpt-5.4")
+    monkeypatch.setattr(
+        gateway_run,
+        "_resolve_runtime_agent_kwargs",
+        lambda: {
+            "provider": "openrouter",
+            "api_mode": "chat_completions",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_key": "***",
+        },
+    )
+
+    import hermes_cli.tools_config as tools_config
+    monkeypatch.setattr(tools_config, "_get_platform_tools", lambda user_config, platform_key: {"core"})
+
+    _CapturingAgent.last_init = None
+    result = await runner._run_agent(
+        message="hi",
+        context_prompt="",
+        history=[],
+        source=_make_source(),
+        session_id="session-1",
+        session_key="agent:agent-a:telegram:dm:12345",
+    )
+
+    assert result["final_response"] == "ok"
+    assert _CapturingAgent.last_init["enterprise_scope"] == scope
+    assert _CapturingAgent.last_init["session_address"] == address

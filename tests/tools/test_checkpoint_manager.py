@@ -612,23 +612,17 @@ class TestGpgAndGlobalConfigIsolation:
         monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
         shadow = _shadow_repo_path(str(work_dir))
         _init_shadow_repo(shadow, str(work_dir))
-        # Inspect the shadow's own config directly — the settings must be
-        # written into the repo, not just inherited via env vars.
-        result = subprocess.run(
-            ["git", "config", "--file", str(shadow / "config"), "--get", "commit.gpgsign"],
-            capture_output=True, text=True,
-        )
-        assert result.stdout.strip() == "false"
+        config_text = (shadow / "config").read_text(encoding="utf-8")
+        assert "[commit]" in config_text
+        assert "gpgsign = false" in config_text
 
     def test_init_sets_tag_gpgsign_false(self, work_dir, checkpoint_base, monkeypatch):
         monkeypatch.setattr("tools.checkpoint_manager.CHECKPOINT_BASE", checkpoint_base)
         shadow = _shadow_repo_path(str(work_dir))
         _init_shadow_repo(shadow, str(work_dir))
-        result = subprocess.run(
-            ["git", "config", "--file", str(shadow / "config"), "--get", "tag.gpgSign"],
-            capture_output=True, text=True,
-        )
-        assert result.stdout.strip() == "false"
+        config_text = (shadow / "config").read_text(encoding="utf-8")
+        assert "[tag]" in config_text
+        assert "gpgSign = false" in config_text
 
     def test_checkpoint_works_with_global_gpgsign_and_broken_gpg(
         self, work_dir, checkpoint_base, monkeypatch, tmp_path

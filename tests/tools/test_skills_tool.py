@@ -288,6 +288,27 @@ class TestSkillsList:
         assert result["count"] == 1
         assert result["skills"][0]["name"] == "skill-a"
 
+    def test_scoped_visibility_hides_skill_from_list(self, tmp_path, monkeypatch):
+        monkeypatch.setenv("HERMES_SCOPE_TENANT_ID", "tenant-b")
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "tenant-a-only",
+                frontmatter_extra=(
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    visibility:\n"
+                    "      tenants: [tenant-a]\n"
+                ),
+            )
+            _make_skill(tmp_path, "shared-skill")
+            raw = skills_list()
+
+        result = json.loads(raw)
+        assert result["success"] is True
+        assert {skill["name"] for skill in result["skills"]} == {"shared-skill"}
+
 
 # ---------------------------------------------------------------------------
 # skill_view
@@ -388,6 +409,28 @@ class TestSkillView:
             raw = skill_view("active-skill")
         result = json.loads(raw)
         assert result["success"] is True
+
+    def test_view_hidden_skill_rejected_by_same_visibility_policy(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_SCOPE_TENANT_ID", "tenant-b")
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "tenant-a-only",
+                frontmatter_extra=(
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    visibility:\n"
+                    "      tenants: [tenant-a]\n"
+                ),
+            )
+            raw = skill_view("tenant-a-only")
+
+        result = json.loads(raw)
+        assert result["success"] is False
+        assert "not visible in this scope" in result["error"].lower()
 
 
 class TestSkillViewSecureSetupOnLoad:

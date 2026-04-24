@@ -231,15 +231,15 @@ def _init_shadow_repo(shadow_repo: Path, working_dir: str) -> Optional[str]:
     if not ok:
         return f"Shadow repo init failed: {err}"
 
-    _run_git(["config", "user.email", "hermes@local"], shadow_repo, working_dir)
-    _run_git(["config", "user.name", "Hermes Checkpoint"], shadow_repo, working_dir)
+    _run_git(["config", "--local", "user.email", "hermes@local"], shadow_repo, working_dir)
+    _run_git(["config", "--local", "user.name", "Hermes Checkpoint"], shadow_repo, working_dir)
     # Explicitly disable commit/tag signing in the shadow repo.  _git_env
     # already isolates from the user's global config, but writing these into
     # the shadow's own config is belt-and-suspenders — it guarantees the
     # shadow repo is correct even if someone inspects or runs git against it
     # directly (without the GIT_CONFIG_* env vars).
-    _run_git(["config", "commit.gpgsign", "false"], shadow_repo, working_dir)
-    _run_git(["config", "tag.gpgSign", "false"], shadow_repo, working_dir)
+    _run_git(["config", "--local", "commit.gpgsign", "false"], shadow_repo, working_dir)
+    _run_git(["config", "--local", "tag.gpgSign", "false"], shadow_repo, working_dir)
 
     info_dir = shadow_repo / "info"
     info_dir.mkdir(exist_ok=True)

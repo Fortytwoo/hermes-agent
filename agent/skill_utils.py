@@ -426,6 +426,100 @@ def extract_skill_description(frontmatter: Dict[str, Any]) -> str:
     return desc
 
 
+def _normalize_string_list(values: Any) -> List[str]:
+    if not values:
+        return []
+    if isinstance(values, str):
+        values = [values]
+    if not isinstance(values, list):
+        return []
+    result: List[str] = []
+    for value in values:
+        normalized = str(value).strip()
+        if normalized:
+            result.append(normalized)
+    return result
+
+
+def extract_skill_visibility_policy(frontmatter: Dict[str, Any]) -> Dict[str, Any]:
+    """Extract normalized enterprise-scope visibility metadata from frontmatter.
+
+    Supported shape::
+
+        metadata:
+          hermes:
+            visibility:
+              tenants: [tenant-a]
+              workspaces: [workspace-a]
+              agents: [agent-a]
+              scopes:
+                - tenant_id: tenant-a
+                  workspace_id: workspace-a
+                  agent_id: agent-a
+
+    Empty or missing policy returns ``{}``, preserving legacy allow-all behavior.
+    """
+    metadata = frontmatter.get("metadata")
+    if not isinstance(metadata, dict):
+        return {}
+    hermes = metadata.get("hermes")
+    if not isinstance(hermes, dict):
+        return {}
+    raw_policy = (
+        hermes.get("visibility")
+        or hermes.get("visible_to")
+        or hermes.get("scope_visibility")
+    )
+    if not isinstance(raw_policy, dict):
+        return {}
+
+    policy: Dict[str, Any] = {}
+
+    tenants = _normalize_string_list(
+        raw_policy.get("tenants") or raw_policy.get("tenant_ids")
+    )
+    workspaces = _normalize_string_list(
+        raw_policy.get("workspaces") or raw_policy.get("workspace_ids")
+    )
+    agents = _normalize_string_list(
+        raw_policy.get("agents") or raw_policy.get("agent_ids")
+    )
+    if tenants:
+        policy["tenant_ids"] = tenants
+    if workspaces:
+        policy["workspace_ids"] = workspaces
+    if agents:
+        policy["agent_ids"] = agents
+
+    raw_scopes = (
+        raw_policy.get("scopes")
+        or raw_policy.get("allow")
+        or raw_policy.get("allowlist")
+    )
+    if isinstance(raw_scopes, dict):
+        raw_scopes = [raw_scopes]
+    if isinstance(raw_scopes, list):
+        normalized_scopes: List[Dict[str, str]] = []
+        for item in raw_scopes:
+            if not isinstance(item, dict):
+                continue
+            entry = {
+                "tenant_id": str(
+                    item.get("tenant_id") or item.get("tenant") or ""
+                ).strip(),
+                "workspace_id": str(
+                    item.get("workspace_id") or item.get("workspace") or ""
+                ).strip(),
+                "agent_id": str(item.get("agent_id") or item.get("agent") or "").strip(),
+            }
+            if any(entry.values()):
+                normalized_scopes.append(entry)
+        if normalized_scopes:
+            policy["scopes"] = normalized_scopes
+
+    return policy
+
+
 # ── File iteration ────────────────────────────────────────────────────────
 
 

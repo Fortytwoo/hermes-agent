@@ -17,7 +17,11 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
+from agent.scope import EnterpriseScope
 import run_agent
+from agent.context_pack import ContextPack, RuntimeContextMetadata
+from agent.scope import EnterpriseScope, SessionAddress
+from agent.tool_policy import ToolPolicy
 from run_agent import AIAgent
 from agent.error_classifier import FailoverReason
 from agent.prompt_builder import DEFAULT_AGENT_IDENTITY
@@ -1714,6 +1718,27 @@ class TestConcurrentToolExecution:
             )
             assert result == "result"
 
+    def test_invoke_tool_passes_enterprise_scope_to_session_search(self, agent):
+        agent._session_db = object()
+        agent.enterprise_scope = EnterpriseScope(
+            tenant_id="acme",
+            workspace_id="ops",
+            agent_id="planner",
+        )
+
+        with patch("tools.session_search_tool.session_search", return_value='{"success": true}') as mock_search:
+            result = agent._invoke_tool("session_search", {"query": "deploy"}, "task-1")
+
+        assert json.loads(result)["success"] is True
+        mock_search.assert_called_once_with(
+            query="deploy",
+            role_filter=None,
+            limit=3,
+            db=agent._session_db,
+            current_session_id=agent.session_id,
+            enterprise_scope=agent.enterprise_scope,
+        )
+
     def test_sequential_tool_callbacks_fire_in_order(self, agent):
         tool_call = _mock_tool_call(name="web_search", arguments='{"query":"hello"}', call_id="c1")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tool_call])
@@ -1779,6 +1804,21 @@ class TestConcurrentToolExecution:
             result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
 
         assert json.loads(result) == {"error": "Blocked"}
+
+    def test_invoke_tool_denies_visible_but_unauthorized_tool(self, agent):
+        agent.valid_tool_names = {"web_search"}
+        agent.authorized_tool_names = set()
+        agent.tool_policy = ToolPolicy(
+            visible_tool_names={"web_search"},
+            authorized_tool_names=set(),
+        )
+
+        with patch("run_agent.handle_function_call", side_effect=AssertionError("should not run")):
+            result = agent._invoke_tool("web_search", {"q": "test"}, "task-1")
+
+        assert json.loads(result) == {
+            "error": "Tool 'web_search' is not authorized in this session"
+        }
 
     def test_sequential_blocked_tool_skips_checkpoints_and_callbacks(self, agent, monkeypatch):
         """Sequential path: blocked tool should not trigger checkpoints or start callbacks."""
@@ -1952,6 +1992,46 @@ class TestRunConversation:
             result = agent.run_conversation("hello")
         assert result["final_response"] == "Final answer"
         assert result["completed"] is True
+
+    def test_context_pack_is_injected_ephemerally(self, agent):
+        self._setup_agent(agent)
+        agent.context_pack = ContextPack(
+            runtime=RuntimeContextMetadata(
+                enterprise_scope=EnterpriseScope(
+                    tenant_id="tenant-1",
+                    workspace_id="workspace-9",
+                    agent_id="planner",
+                ),
+                session_address=SessionAddress(
+                    platform="slack",
+                    chat_type="channel",
+                    chat_id="C123",
+                    thread_id="T456",
+                ),
+                user_id="user-7",
+                platform="slack",
+                session_id="session-1",
+            )
+        )
+        resp = _mock_response(content="Final answer", finish_reason="stop")
+        agent.client.chat.completions.create.return_value = resp
+
+        with (
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("hello")
+
+        api_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        api_user_messages = [msg for msg in api_messages if msg.get("role") == "user"]
+        persisted_user_messages = [
+            msg for msg in result["messages"] if msg.get("role") == "user"
+        ]
+
+        assert "tenant-1" in api_user_messages[-1]["content"]
+        assert "workspace-9" in api_user_messages[-1]["content"]
+        assert persisted_user_messages[-1]["content"] == "hello"
 
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)

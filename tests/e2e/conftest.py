@@ -10,6 +10,8 @@ No LLM, no real platform connections.
 """
 
 import asyncio
+import importlib
+import importlib.util
 import sys
 import uuid
 from datetime import datetime, timezone
@@ -59,7 +61,16 @@ def _ensure_telegram_mock():
 def _ensure_discord_mock():
     """Install mock discord modules so DiscordAdapter can be imported."""
     if "discord" in sys.modules and hasattr(sys.modules["discord"], "__file__"):
-        return # Real library installed
+        return  # Real library already imported
+
+    # If the real discord.py package is installed, import it instead of
+    # shadowing it with a MagicMock. Some integration tests in the same
+    # pytest run exercise real voice crypto/Opus paths and require the
+    # actual package, even though these e2e tests only need lightweight
+    # adapter behavior.
+    if importlib.util.find_spec("discord") is not None:
+        importlib.import_module("discord")
+        return
 
     discord_mod = MagicMock()
     discord_mod.Intents.default.return_value = MagicMock()

@@ -530,7 +530,7 @@ def _collect_gateway_skill_entries(
         from tools.skills_tool import SKILLS_DIR
         _skills_dir = str(SKILLS_DIR.resolve())
         _hub_dir = str((SKILLS_DIR / ".hub").resolve())
-        skill_cmds = get_skill_commands()
+        skill_cmds = get_skill_commands(platform=platform)
         for cmd_key in sorted(skill_cmds):
             info = skill_cmds[cmd_key]
             skill_path = info.get("skill_md_path", "")
@@ -677,7 +677,7 @@ def discord_skill_commands_by_category(
         from tools.skills_tool import SKILLS_DIR
         _skills_dir = SKILLS_DIR.resolve()
         _hub_dir = (SKILLS_DIR / ".hub").resolve()
-        skill_cmds = get_skill_commands()
+        skill_cmds = get_skill_commands(platform="discord")
 
         for cmd_key in sorted(skill_cmds):
             info = skill_cmds[cmd_key]

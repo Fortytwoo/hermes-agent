@@ -10,6 +10,7 @@ from agent.skill_commands import (
     build_plan_path,
     build_preloaded_skills_prompt,
     build_skill_invocation_message,
+    get_skill_commands,
     resolve_skill_command_key,
     scan_skill_commands,
 )
@@ -143,6 +144,29 @@ class TestScanSkillCommands:
             result = scan_skill_commands()
         assert "/sonarr-v3v4-api" in result
         assert any("/" in k[1:] for k in result) is False  # no unescaped /
+
+    def test_scope_specific_cache_does_not_leak_commands_between_scopes(
+        self, tmp_path, monkeypatch
+    ):
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path):
+            _make_skill(
+                tmp_path,
+                "tenant-a-only",
+                frontmatter_extra=(
+                    "metadata:\n"
+                    "  hermes:\n"
+                    "    visibility:\n"
+                    "      tenants: [tenant-a]\n"
+                ),
+            )
+
+            monkeypatch.setenv("HERMES_SCOPE_TENANT_ID", "tenant-a")
+            visible = get_skill_commands()
+            assert "/tenant-a-only" in visible
+
+            monkeypatch.setenv("HERMES_SCOPE_TENANT_ID", "tenant-b")
+            hidden = get_skill_commands()
+            assert "/tenant-a-only" not in hidden
 
 
 class TestResolveSkillCommandKey:

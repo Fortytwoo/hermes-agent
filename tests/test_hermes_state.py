@@ -4,6 +4,7 @@ import time
 import pytest
 from pathlib import Path
 
+from agent.scope import EnterpriseScope, SessionAddress
 from hermes_state import SessionDB
 
 
@@ -354,6 +355,27 @@ class TestFTS5Search:
         roles = [r["role"] for r in results]
         assert all(r == "assistant" for r in roles)
 
+    def test_search_messages_filters_enterprise_scope_on_fts_path(self, db):
+        scope = EnterpriseScope(tenant_id="acme", workspace_id="ops", agent_id="planner")
+
+        db.create_session("scoped", "cli", enterprise_scope=scope)
+        db.append_message("scoped", "user", "Docker rollout checklist")
+
+        db.create_session(
+            "foreign",
+            "cli",
+            enterprise_scope=EnterpriseScope(
+                tenant_id="other",
+                workspace_id="ops",
+                agent_id="planner",
+            ),
+        )
+        db.append_message("foreign", "user", "Docker rollout checklist")
+
+        results = db.search_messages("Docker", enterprise_scope=scope)
+
+        assert {row["session_id"] for row in results} == {"scoped"}
+
     def test_search_returns_context(self, db):
         db.create_session(session_id="s1", source="cli")
         db.append_message("s1", role="user", content="Tell me about Kubernetes")
@@ -621,6 +643,27 @@ class TestCJKSearchFallback:
         results = db.search_messages("记忆断裂", role_filter=["assistant"])
         assert len(results) == 1
         assert results[0]["role"] == "assistant"
+
+    def test_cjk_fallback_filters_enterprise_scope(self, db):
+        scope = EnterpriseScope(tenant_id="acme", workspace_id="ops", agent_id="planner")
+
+        db.create_session("scoped-cjk", "cli", enterprise_scope=scope)
+        db.append_message("scoped-cjk", "user", "用户问记忆断裂怎么处理")
+
+        db.create_session(
+            "foreign-cjk",
+            "cli",
+            enterprise_scope=EnterpriseScope(
+                tenant_id="other",
+                workspace_id="ops",
+                agent_id="planner",
+            ),
+        )
+        db.append_message("foreign-cjk", "user", "用户问记忆断裂怎么处理")
+
+        results = db.search_messages("记忆断裂", enterprise_scope=scope)
+
+        assert {row["session_id"] for row in results} == {"scoped-cjk"}
 
     def test_cjk_snippet_is_centered_on_match(self, db):
         """Snippet should contain the search term, not just the first N chars."""
@@ -1120,7 +1163,7 @@ class TestSchemaInit:
     def test_schema_version(self, db):
         cursor = db._conn.execute("SELECT version FROM schema_version")
         version = cursor.fetchone()[0]
-        assert version == 6
+        assert version == 7
 
     def test_title_column_exists(self, db):
         """Verify the title column was created in the sessions table."""
@@ -1176,12 +1219,12 @@ class TestSchemaInit:
         conn.commit()
         conn.close()
 
-        # Open with SessionDB — should migrate to v6
+        # Open with SessionDB — should migrate to v7
         migrated_db = SessionDB(db_path=db_path)
 
         # Verify migration
         cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
-        assert cursor.fetchone()[0] == 6
+        assert cursor.fetchone()[0] == 7
 
         # Verify title column exists and is NULL for existing sessions
         session = migrated_db.get_session("existing")
@@ -1479,6 +1522,40 @@ class TestCompressionChainProjection:
         # root1's tip must be tip1 (via mid1), not delegate1.
         assert db.get_compression_tip("root1") == "tip1"
 
+    def test_get_compression_tip_stays_within_enterprise_scope(self, db):
+        import time as _time
+
+        scope = EnterpriseScope(tenant_id="acme", workspace_id="ops", agent_id="planner")
+        other_scope = EnterpriseScope(tenant_id="other", workspace_id="ops", agent_id="planner")
+        t0 = _time.time() - 3600
+
+        db.create_session("root-scope", "cli", enterprise_scope=scope)
+        db._conn.execute("UPDATE sessions SET started_at=?, ended_at=?, end_reason=? WHERE id=?", (
+            t0,
+            t0 + 10,
+            "compression",
+            "root-scope",
+        ))
+
+        db.create_session(
+            "tip-in-scope",
+            "cli",
+            parent_session_id="root-scope",
+            enterprise_scope=scope,
+        )
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 11, "tip-in-scope"))
+
+        db.create_session(
+            "tip-out-of-scope",
+            "cli",
+            parent_session_id="root-scope",
+            enterprise_scope=other_scope,
+        )
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 12, "tip-out-of-scope"))
+        db._conn.commit()
+
+        assert db.get_compression_tip("root-scope", enterprise_scope=scope) == "tip-in-scope"
+
     def test_list_surfaces_tip_for_compressed_root(self, db):
         """The list must show the tip's id/message_count/preview in place of
         the root row, so users can see and resume the live conversation.
@@ -1547,6 +1624,49 @@ class TestCompressionChainProjection:
         # 'newer' started AFTER root1 but BEFORE tip1's actual started_at.
         # Correct ordering (by root started_at): newer > tip1's lineage entry.
         assert ids_in_order.index("newer") < ids_in_order.index("tip1")
+
+    def test_list_sessions_rich_filters_enterprise_scope_and_tip_projection(self, db):
+        import time as _time
+
+        scope = EnterpriseScope(tenant_id="acme", workspace_id="ops", agent_id="planner")
+        other_scope = EnterpriseScope(tenant_id="other", workspace_id="ops", agent_id="planner")
+        t0 = _time.time() - 3600
+
+        db.create_session("root-scoped", "cli", enterprise_scope=scope)
+        db._conn.execute("UPDATE sessions SET started_at=?, ended_at=?, end_reason=? WHERE id=?", (
+            t0,
+            t0 + 10,
+            "compression",
+            "root-scoped",
+        ))
+
+        db.create_session(
+            "tip-scoped",
+            "cli",
+            parent_session_id="root-scoped",
+            enterprise_scope=scope,
+        )
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 11, "tip-scoped"))
+        db.append_message("tip-scoped", "user", "scoped continuation")
+
+        db.create_session(
+            "tip-foreign",
+            "cli",
+            parent_session_id="root-scoped",
+            enterprise_scope=other_scope,
+        )
+        db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0 + 12, "tip-foreign"))
+        db.append_message("tip-foreign", "user", "foreign continuation")
+
+        db.create_session("other-root", "cli", enterprise_scope=other_scope)
+        db.append_message("other-root", "user", "other tenant session")
+        db._conn.commit()
+
+        sessions = db.list_sessions_rich(source="cli", limit=20, enterprise_scope=scope)
+
+        assert [row["id"] for row in sessions] == ["tip-scoped"]
+        assert sessions[0]["_lineage_root_id"] == "root-scoped"
+        assert sessions[0]["preview"].startswith("scoped continuation")
 
     def test_list_handles_broken_chain_gracefully(self, db):
         """A compression root with no child (e.g. DB corruption or a partial
@@ -1732,3 +1852,172 @@ class TestConcurrentWriteSafety:
         assert "30" in src, (
             "SQLite timeout should be at least 30s to handle CLI/gateway lock contention"
         )
+
+
+class TestSessionScopeMetadata:
+    def test_schema_version_is_v7(self, db):
+        cursor = db._conn.execute("SELECT version FROM schema_version")
+        version = cursor.fetchone()[0]
+        assert version == 7
+
+    def test_scope_columns_exist(self, db):
+        cursor = db._conn.execute("PRAGMA table_info(sessions)")
+        columns = {row[1] for row in cursor.fetchall()}
+        assert "tenant_id" in columns
+        assert "workspace_id" in columns
+        assert "agent_id" in columns
+        assert "chat_id" in columns
+        assert "thread_id" in columns
+        assert "chat_type" in columns
+
+    def test_create_session_persists_scope_and_address(self, db):
+        db.create_session(
+            session_id="scoped-1",
+            source="telegram",
+            enterprise_scope=EnterpriseScope(
+                tenant_id="acme",
+                workspace_id="ops",
+                agent_id="planner",
+            ),
+            session_address=SessionAddress(
+                source="telegram",
+                platform="telegram",
+                chat_type="group",
+                chat_id="-100",
+                thread_id="42",
+                user_id="alice",
+            ),
+        )
+
+        row = db.get_session("scoped-1")
+
+        assert row["tenant_id"] == "acme"
+        assert row["workspace_id"] == "ops"
+        assert row["agent_id"] == "planner"
+        assert row["chat_id"] == "-100"
+        assert row["thread_id"] == "42"
+        assert row["chat_type"] == "group"
+
+    def test_ensure_session_persists_scope_and_address_when_creating_row(self, db):
+        db.ensure_session(
+            "scoped-late",
+            source="gateway",
+            model="gpt-test",
+            enterprise_scope=EnterpriseScope(
+                tenant_id="acme",
+                workspace_id="ops",
+                agent_id="planner",
+            ),
+            session_address=SessionAddress(
+                source="telegram",
+                platform="telegram",
+                chat_type="group",
+                chat_id="-100",
+                thread_id="42",
+                user_id="alice",
+            ),
+        )
+
+        row = db.get_session("scoped-late")
+
+        assert row["source"] == "gateway"
+        assert row["model"] == "gpt-test"
+        assert row["tenant_id"] == "acme"
+        assert row["workspace_id"] == "ops"
+        assert row["agent_id"] == "planner"
+        assert row["chat_id"] == "-100"
+        assert row["thread_id"] == "42"
+        assert row["chat_type"] == "group"
+
+    def test_legacy_create_session_call_still_works(self, db):
+        db.create_session(session_id="legacy-call", source="cli")
+
+        row = db.get_session("legacy-call")
+
+        assert row is not None
+        assert row["source"] == "cli"
+        assert row["tenant_id"] is None
+        assert row["workspace_id"] is None
+        assert row["agent_id"] is None
+        assert row["chat_id"] is None
+        assert row["thread_id"] is None
+        assert row["chat_type"] is None
+
+    def test_migration_from_v6_adds_scope_columns(self, tmp_path):
+        import sqlite3
+
+        db_path = tmp_path / "migrate_scope_v7.db"
+        conn = sqlite3.connect(str(db_path))
+        conn.executescript(
+            """
+            CREATE TABLE schema_version (version INTEGER NOT NULL);
+            INSERT INTO schema_version (version) VALUES (6);
+
+            CREATE TABLE sessions (
+                id TEXT PRIMARY KEY,
+                source TEXT NOT NULL,
+                user_id TEXT,
+                model TEXT,
+                model_config TEXT,
+                system_prompt TEXT,
+                parent_session_id TEXT,
+                started_at REAL NOT NULL,
+                ended_at REAL,
+                end_reason TEXT,
+                message_count INTEGER DEFAULT 0,
+                tool_call_count INTEGER DEFAULT 0,
+                input_tokens INTEGER DEFAULT 0,
+                output_tokens INTEGER DEFAULT 0,
+                cache_read_tokens INTEGER DEFAULT 0,
+                cache_write_tokens INTEGER DEFAULT 0,
+                reasoning_tokens INTEGER DEFAULT 0,
+                billing_provider TEXT,
+                billing_base_url TEXT,
+                billing_mode TEXT,
+                estimated_cost_usd REAL,
+                actual_cost_usd REAL,
+                cost_status TEXT,
+                cost_source TEXT,
+                pricing_version TEXT,
+                title TEXT
+            );
+
+            CREATE TABLE messages (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                session_id TEXT NOT NULL,
+                role TEXT NOT NULL,
+                content TEXT,
+                tool_call_id TEXT,
+                tool_calls TEXT,
+                tool_name TEXT,
+                timestamp REAL NOT NULL,
+                token_count INTEGER,
+                finish_reason TEXT,
+                reasoning TEXT,
+                reasoning_details TEXT,
+                codex_reasoning_items TEXT
+            );
+            """
+        )
+        conn.execute(
+            "INSERT INTO sessions (id, source, started_at) VALUES (?, ?, ?)",
+            ("existing-v6", "cli", 1000.0),
+        )
+        conn.commit()
+        conn.close()
+
+        migrated_db = SessionDB(db_path=db_path)
+
+        cursor = migrated_db._conn.execute("SELECT version FROM schema_version")
+        assert cursor.fetchone()[0] == 7
+
+        session = migrated_db.get_session("existing-v6")
+        assert session is not None
+        assert session["tenant_id"] is None
+        assert session["workspace_id"] is None
+        assert session["agent_id"] is None
+        assert session["chat_id"] is None
+        assert session["thread_id"] is None
+        assert session["chat_type"] is None
+
+        migrated_db.close()

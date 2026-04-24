@@ -39,7 +39,10 @@ from types import SimpleNamespace
 import uuid
 from typing import List, Dict, Any, Optional
 from openai import OpenAI
-import fire
+try:
+    import fire
+except ImportError:  # pragma: no cover - only exercised in minimal test envs
+    fire = None
 from datetime import datetime
 from pathlib import Path
 
@@ -80,6 +83,8 @@ from hermes_constants import OPENROUTER_BASE_URL
 
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import build_memory_context_block, sanitize_context
+from agent.memory_backend import MemoryBackend
+from agent.scope import EnterpriseScope, SessionAddress
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
 from agent.prompt_builder import (
@@ -96,9 +101,12 @@ from agent.model_metadata import (
     query_ollama_num_ctx,
 )
 from agent.context_compressor import ContextCompressor
+from agent.context_pack import ContextPack
+from agent.enterprise_context_engine import EnterpriseContextEngine
 from agent.subdirectory_hints import SubdirectoryHintTracker
 from agent.prompt_caching import apply_anthropic_cache_control
 from agent.prompt_builder import build_skills_system_prompt, build_context_files_prompt, build_environment_hints, load_soul_md, TOOL_USE_ENFORCEMENT_GUIDANCE, TOOL_USE_ENFORCEMENT_MODELS, DEVELOPER_ROLE_MODELS, GOOGLE_MODEL_OPERATIONAL_GUIDANCE, OPENAI_MODEL_EXECUTION_GUIDANCE
+from agent.tool_policy import ToolPolicy
 from agent.usage_pricing import estimate_usage_cost, normalize_usage
 from agent.codex_responses_adapter import (
     _chat_content_to_responses_parts,
@@ -752,6 +760,9 @@ class AIAgent:
         platform: str = None,
         user_id: str = None,
         gateway_session_key: str = None,
+        enterprise_scope: Optional[EnterpriseScope] = None,
+        session_address: Optional[SessionAddress] = None,
+        tool_policy: Optional[ToolPolicy] = None,
         skip_context_files: bool = False,
         skip_memory: bool = False,
         session_db=None,
@@ -821,6 +832,19 @@ class AIAgent:
         self.platform = platform  # "cli", "telegram", "discord", "whatsapp", etc.
         self._user_id = user_id  # Platform user identifier (gateway sessions)
         self._gateway_session_key = gateway_session_key  # Stable per-chat key (e.g. agent:main:telegram:dm:123)
+        self.enterprise_scope = enterprise_scope or EnterpriseScope()
+        self.session_address = session_address or SessionAddress()
+        self.tool_policy = tool_policy
+        self.context_pack: Optional[ContextPack] = None
+        _enterprise_runtime_engine = EnterpriseContextEngine()
+        if self.tool_policy is None:
+            self.tool_policy = _enterprise_runtime_engine.resolve_tool_policy(
+                enterprise_scope=self.enterprise_scope,
+                session_address=self.session_address,
+                user_id=self._user_id or "",
+                platform=self.platform or "",
+                session_id=session_id or "",
+            )
         # Pluggable print function — CLI replaces this with _cprint so that
         # raw ANSI status lines are routed through prompt_toolkit's renderer
         # instead of going directly to stdout where patch_stdout's StdoutProxy
@@ -1293,6 +1317,7 @@ class AIAgent:
             enabled_toolsets=enabled_toolsets,
             disabled_toolsets=disabled_toolsets,
             quiet_mode=self.quiet_mode,
+            tool_policy=self.tool_policy,
         )
         
         # Show tool configuration and store valid tool names for validation
@@ -1310,6 +1335,10 @@ class AIAgent:
                     print(f"   ❌ Disabled toolsets: {', '.join(disabled_toolsets)}")
         elif not self.quiet_mode:
             print("🛠️  No tools loaded (all tools filtered out or unavailable)")
+        self.authorized_tool_names = (
+            self.tool_policy.filter_authorized(self.valid_tool_names)
+            if self.tool_policy else set(self.valid_tool_names)
+        )
         
         # Check tool requirements
         if self.tools and not self.quiet_mode:
@@ -1347,6 +1376,13 @@ class AIAgent:
             timestamp_str = self.session_start.strftime("%Y%m%d_%H%M%S")
             short_uuid = uuid.uuid4().hex[:6]
             self.session_id = f"{timestamp_str}_{short_uuid}"
+        self.context_pack = _enterprise_runtime_engine.build_context_pack(
+            enterprise_scope=self.enterprise_scope,
+            session_address=self.session_address,
+            user_id=self._user_id or "",
+            platform=self.platform or "",
+            session_id=self.session_id,
+        )
         
         # Session logs go into ~/.hermes/sessions/ alongside gateway sessions
         hermes_home = get_hermes_home()
@@ -1384,6 +1420,8 @@ class AIAgent:
                     },
                     user_id=None,
                     parent_session_id=self._parent_session_id,
+                    enterprise_scope=self.enterprise_scope,
+                    session_address=self.session_address,
                 )
             except Exception as e:
                 # Transient SQLite lock contention (e.g. CLI and gateway writing
@@ -1410,6 +1448,7 @@ class AIAgent:
         # needed later by the startup feasibility check.  Avoid exposing a
         # broad pseudo-public config object on the agent instance.
         self._aux_compression_context_length_config = None
+        self._memory_backend = MemoryBackend(get_hermes_home() / "memories")
 
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
@@ -1431,6 +1470,9 @@ class AIAgent:
                     self._memory_store = MemoryStore(
                         memory_char_limit=mem_config.get("memory_char_limit", 2200),
                         user_char_limit=mem_config.get("user_char_limit", 1375),
+                        enterprise_scope=self.enterprise_scope,
+                        user_id=self._user_id,
+                        backend=self._memory_backend,
                     )
                     self._memory_store.load_from_disk()
             except Exception:
@@ -1713,13 +1755,32 @@ class AIAgent:
         # Inject context engine tool schemas (e.g. lcm_grep, lcm_describe, lcm_expand)
         self._context_engine_tool_names: set = set()
         if hasattr(self, "context_compressor") and self.context_compressor and self.tools is not None:
-            for _schema in self.context_compressor.get_tool_schemas():
+            _context_engine_schemas = list(self.context_compressor.get_tool_schemas())
+            _visible_context_engine_tool_names = (
+                self.tool_policy.filter_visible(
+                    _schema.get("name", "")
+                    for _schema in _context_engine_schemas
+                    if _schema.get("name")
+                )
+                if self.tool_policy else None
+            )
+            for _schema in _context_engine_schemas:
                 _wrapped = {"type": "function", "function": _schema}
-                self.tools.append(_wrapped)
                 _tname = _schema.get("name", "")
+                if (
+                    _visible_context_engine_tool_names is not None
+                    and _tname
+                    and _tname not in _visible_context_engine_tool_names
+                ):
+                    continue
+                self.tools.append(_wrapped)
                 if _tname:
                     self.valid_tool_names.add(_tname)
                     self._context_engine_tool_names.add(_tname)
+        self.authorized_tool_names = (
+            self.tool_policy.filter_authorized(self.valid_tool_names)
+            if self.tool_policy else set(self.valid_tool_names)
+        )
 
         # Notify context engine of session start
         if hasattr(self, "context_compressor") and self.context_compressor:
@@ -2015,8 +2076,9 @@ class AIAgent:
         old_norm = (old_provider or "").strip().lower()
         new_norm = (new_provider or "").strip().lower()
         if old_norm and new_norm and old_norm != new_norm:
+            existing_chain = list(getattr(self, "_fallback_chain", []) or [])
             self._fallback_chain = [
-                entry for entry in self._fallback_chain
+                entry for entry in existing_chain
                 if (entry.get("provider") or "").strip().lower() not in {old_norm, new_norm}
             ]
             self._fallback_model = self._fallback_chain[0] if self._fallback_chain else None
@@ -2829,6 +2891,9 @@ class AIAgent:
                         quiet_mode=True,
                         platform=self.platform,
                         provider=self.provider,
+                        user_id=self._user_id,
+                        enterprise_scope=self.enterprise_scope,
+                        session_address=self.session_address,
                     )
                     review_agent._memory_store = self._memory_store
                     review_agent._memory_enabled = self._memory_enabled
@@ -2943,6 +3008,8 @@ class AIAgent:
                 self.session_id,
                 source=self.platform or "cli",
                 model=self.model,
+                enterprise_scope=self.enterprise_scope,
+                session_address=self.session_address,
             )
             start_idx = len(conversation_history) if conversation_history else 0
             flush_from = max(start_idx, self._last_flushed_db_idx)
@@ -3892,13 +3959,15 @@ class AIAgent:
 
         # 2. Clean terminal sandbox environments
         try:
-            cleanup_vm(task_id)
+            from tools.terminal_tool import cleanup_vm as _cleanup_vm
+            _cleanup_vm(task_id)
         except Exception:
             pass
 
         # 3. Clean browser daemon sessions
         try:
-            cleanup_browser(task_id)
+            from tools.browser_tool import cleanup_browser as _cleanup_browser
+            _cleanup_browser(task_id)
         except Exception:
             pass
 
@@ -7574,6 +7643,8 @@ class AIAgent:
                     source=self.platform or os.environ.get("HERMES_SESSION_SOURCE", "cli"),
                     model=self.model,
                     parent_session_id=old_session_id,
+                    enterprise_scope=self.enterprise_scope,
+                    session_address=self.session_address,
                 )
                 # Auto-number the title for the continuation session
                 if old_title:
@@ -7683,6 +7754,14 @@ class AIAgent:
             pass
         if block_message is not None:
             return json.dumps({"error": block_message}, ensure_ascii=False)
+        if (
+            function_name in self.valid_tool_names
+            and function_name not in self.authorized_tool_names
+        ):
+            return json.dumps(
+                {"error": f"Tool '{function_name}' is not authorized in this session"},
+                ensure_ascii=False,
+            )
 
         if function_name == "todo":
             from tools.todo_tool import todo_tool as _todo_tool
@@ -7701,6 +7780,7 @@ class AIAgent:
                 limit=function_args.get("limit", 3),
                 db=self._session_db,
                 current_session_id=self.session_id,
+                enterprise_scope=self.enterprise_scope,
             )
         elif function_name == "memory":
             target = function_args.get("target", "memory")
@@ -8209,6 +8289,7 @@ class AIAgent:
                         limit=function_args.get("limit", 3),
                         db=self._session_db,
                         current_session_id=self.session_id,
+                        enterprise_scope=self.enterprise_scope,
                     )
                 tool_duration = time.time() - tool_start_time
                 if self._should_emit_quiet_tool_messages():
@@ -9123,6 +9204,10 @@ class AIAgent:
                         _fenced = build_memory_context_block(_ext_prefetch_cache)
                         if _fenced:
                             _injections.append(_fenced)
+                    if self.context_pack:
+                        _context_pack = self.context_pack.render()
+                        if _context_pack:
+                            _injections.append(_context_pack)
                     if _plugin_user_context:
                         _injections.append(_plugin_user_context)
                     if _injections:
@@ -12152,4 +12237,6 @@ def main(
 
 
 if __name__ == "__main__":
+    if fire is None:
+        raise ModuleNotFoundError("fire is required to run run_agent.py as a CLI entrypoint")
     fire.Fire(main)

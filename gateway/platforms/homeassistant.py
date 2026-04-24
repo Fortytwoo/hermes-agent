@@ -187,15 +187,22 @@ class HomeAssistantAdapter(BasePlatformAdapter):
     async def _cleanup_ws(self) -> None:
         """Close WebSocket and session."""
         if self._ws and not self._ws.closed:
-            await self._ws.close()
-        self._ws = None
+            # `ClientWebSocketResponse.close()` waits for a close frame from the
+            # peer, which can stall shutdown if the server stops reading while
+            # we are tearing down. Abort the underlying response instead.
+            self._ws._set_closed()
+            self._ws._response.close()
         if self._session and not self._session.closed:
             await self._session.close()
+        self._ws = None
         self._session = None
 
     async def disconnect(self) -> None:
         """Disconnect from Home Assistant."""
         self._running = False
+        # Closing the client session aborts pending WebSocket reads without
+        # waiting for a close frame from the server.
+        await self._cleanup_ws()
         if self._listen_task:
             self._listen_task.cancel()
             try:
@@ -203,8 +210,6 @@ class HomeAssistantAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
             self._listen_task = None
-
-        await self._cleanup_ws()
         if self._rest_session and not self._rest_session.closed:
             await self._rest_session.close()
         self._rest_session = None

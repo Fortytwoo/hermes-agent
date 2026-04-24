@@ -613,6 +613,10 @@ def _build_child_agent(
         ephemeral_system_prompt=child_prompt,
         log_prefix=f"[subagent-{task_index}]",
         platform=parent_agent.platform,
+        user_id=getattr(parent_agent, "_user_id", None),
+        gateway_session_key=getattr(parent_agent, "_gateway_session_key", None),
+        enterprise_scope=getattr(parent_agent, "enterprise_scope", None),
+        session_address=getattr(parent_agent, "session_address", None),
         skip_context_files=True,
         skip_memory=True,
         clarify_callback=None,
@@ -623,6 +627,7 @@ def _build_child_agent(
         providers_ignored=parent_agent.providers_ignored,
         providers_order=parent_agent.providers_order,
         provider_sort=parent_agent.provider_sort,
+        tool_policy=getattr(parent_agent, "tool_policy", None),
         tool_progress_callback=child_progress_cb,
         iteration_budget=None,  # fresh budget per subagent
     )

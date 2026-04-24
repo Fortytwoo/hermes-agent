@@ -22,6 +22,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from agent.scope import EnterpriseScope, SessionAddress
 from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
@@ -31,7 +32,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -65,6 +66,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_source TEXT,
     pricing_version TEXT,
     title TEXT,
+    tenant_id TEXT,
+    workspace_id TEXT,
+    agent_id TEXT,
+    chat_id TEXT,
+    thread_id TEXT,
+    chat_type TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -329,6 +336,27 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                for col_name, col_type in [
+                    ("tenant_id", "TEXT"),
+                    ("workspace_id", "TEXT"),
+                    ("agent_id", "TEXT"),
+                    ("chat_id", "TEXT"),
+                    ("thread_id", "TEXT"),
+                    ("chat_type", "TEXT"),
+                ]:
+                    try:
+                        safe = col_name.replace('"', '""')
+                        cursor.execute(
+                            f'ALTER TABLE sessions ADD COLUMN "{safe}" {col_type}'
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_sessions_scope "
+                    "ON sessions(tenant_id, workspace_id, agent_id, started_at DESC)"
+                )
+                cursor.execute("UPDATE schema_version SET version = 7")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -336,6 +364,13 @@ class SessionDB:
             cursor.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
                 "ON sessions(title) WHERE title IS NOT NULL"
+            )
+        except sqlite3.OperationalError:
+            pass  # Index already exists
+        try:
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_scope "
+                "ON sessions(tenant_id, workspace_id, agent_id, started_at DESC)"
             )
         except sqlite3.OperationalError:
             pass  # Index already exists
@@ -352,6 +387,75 @@ class SessionDB:
     # Session lifecycle
     # =========================================================================
 
+    @staticmethod
+    def _session_scope_columns(
+        enterprise_scope: Optional[EnterpriseScope],
+        session_address: Optional[SessionAddress],
+    ) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
+        scope = enterprise_scope
+        address = session_address
+        return (
+            (scope.tenant_id or None) if scope else None,
+            (scope.workspace_id or None) if scope else None,
+            ((scope.agent_id or "main") if scope else None),
+            (address.chat_id or None) if address else None,
+            (address.thread_id or None) if address else None,
+            (address.chat_type or None) if address else None,
+        )
+
+    @staticmethod
+    def _normalized_enterprise_scope(
+        enterprise_scope: Optional[EnterpriseScope],
+    ) -> Optional[tuple[Optional[str], Optional[str], Optional[str]]]:
+        if not enterprise_scope or not enterprise_scope.is_scoped():
+            return None
+        return (
+            enterprise_scope.tenant_id or None,
+            enterprise_scope.workspace_id or None,
+            enterprise_scope.agent_id or "main",
+        )
+
+    @classmethod
+    def _build_scope_filters(
+        cls,
+        enterprise_scope: Optional[EnterpriseScope],
+        table_alias: str = "s",
+    ) -> tuple[list[str], list[str]]:
+        normalized_scope = cls._normalized_enterprise_scope(enterprise_scope)
+        if normalized_scope is None:
+            return [], []
+
+        clauses: list[str] = []
+        params: list[str] = []
+        for column, value in zip(
+            ("tenant_id", "workspace_id", "agent_id"),
+            normalized_scope,
+        ):
+            qualified = f"{table_alias}.{column}"
+            if value is None:
+                clauses.append(f"{qualified} IS NULL")
+            else:
+                clauses.append(f"{qualified} = ?")
+                params.append(value)
+        return clauses, params
+
+    @classmethod
+    def _session_matches_scope(
+        cls,
+        session: Optional[Dict[str, Any]],
+        enterprise_scope: Optional[EnterpriseScope],
+    ) -> bool:
+        normalized_scope = cls._normalized_enterprise_scope(enterprise_scope)
+        if normalized_scope is None:
+            return True
+        if not session:
+            return False
+        return (
+            (session.get("tenant_id") or None),
+            (session.get("workspace_id") or None),
+            (session.get("agent_id") or None),
+        ) == normalized_scope
+
     def create_session(
         self,
         session_id: str,
@@ -361,13 +465,22 @@ class SessionDB:
         system_prompt: str = None,
         user_id: str = None,
         parent_session_id: str = None,
+        *,
+        enterprise_scope: Optional[EnterpriseScope] = None,
+        session_address: Optional[SessionAddress] = None,
     ) -> str:
         """Create a new session record. Returns the session_id."""
+        session_scope_columns = self._session_scope_columns(
+            enterprise_scope,
+            session_address,
+        )
+
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, parent_session_id, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   system_prompt, parent_session_id, started_at, tenant_id, workspace_id,
+                   agent_id, chat_id, thread_id, chat_type)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     source,
@@ -377,6 +490,7 @@ class SessionDB:
                     system_prompt,
                     parent_session_id,
                     time.time(),
+                    *session_scope_columns,
                 ),
             )
         self._execute_write(_do)
@@ -513,6 +627,9 @@ class SessionDB:
         session_id: str,
         source: str = "unknown",
         model: str = None,
+        *,
+        enterprise_scope: Optional[EnterpriseScope] = None,
+        session_address: Optional[SessionAddress] = None,
     ) -> None:
         """Ensure a session row exists, creating it with minimal metadata if absent.
 
@@ -520,12 +637,18 @@ class SessionDB:
         create_session() call (e.g. transient SQLite lock at agent startup).
         INSERT OR IGNORE is safe to call even when the row already exists.
         """
+        session_scope_columns = self._session_scope_columns(
+            enterprise_scope,
+            session_address,
+        )
+
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions
-                   (id, source, model, started_at)
-                   VALUES (?, ?, ?, ?)""",
-                (session_id, source, model, time.time()),
+                   (id, source, model, started_at, tenant_id, workspace_id,
+                    agent_id, chat_id, thread_id, chat_type)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, source, model, time.time(), *session_scope_columns),
             )
         self._execute_write(_do)
 
@@ -723,7 +846,11 @@ class SessionDB:
 
         return f"{base} #{max_num + 1}"
 
-    def get_compression_tip(self, session_id: str) -> Optional[str]:
+    def get_compression_tip(
+        self,
+        session_id: str,
+        enterprise_scope: Optional[EnterpriseScope] = None,
+    ) -> Optional[str]:
         """Walk the compression-continuation chain forward and return the tip.
 
         A compression continuation is a child session where:
@@ -739,19 +866,34 @@ class SessionDB:
         input itself doesn't exist).
         """
         current = session_id
+        if not self._session_matches_scope(
+            self.get_session(current),
+            enterprise_scope,
+        ):
+            return current
+
+        scope_clauses, scope_params = self._build_scope_filters(
+            enterprise_scope,
+            table_alias="child",
+        )
+        scope_sql = ""
+        if scope_clauses:
+            scope_sql = " AND " + " AND ".join(scope_clauses)
+
         # Bound the walk defensively — compression chains this deep are
         # pathological and shouldn't happen in practice. 100 = plenty.
         for _ in range(100):
             with self._lock:
                 cursor = self._conn.execute(
-                    "SELECT id FROM sessions "
-                    "WHERE parent_session_id = ? "
-                    "  AND started_at >= ("
-                    "      SELECT ended_at FROM sessions "
-                    "      WHERE id = ? AND end_reason = 'compression'"
+                    "SELECT child.id FROM sessions child "
+                    "WHERE child.parent_session_id = ? "
+                    "  AND child.started_at >= ("
+                    "      SELECT ended_at FROM sessions parent "
+                    "      WHERE parent.id = ? AND parent.end_reason = 'compression'"
                     "  ) "
-                    "ORDER BY started_at DESC LIMIT 1",
-                    (current, current),
+                    f"{scope_sql} "
+                    "ORDER BY child.started_at DESC LIMIT 1",
+                    (current, current, *scope_params),
                 )
                 row = cursor.fetchone()
             if row is None:
@@ -767,6 +909,7 @@ class SessionDB:
         offset: int = 0,
         include_children: bool = False,
         project_compression_tips: bool = True,
+        enterprise_scope: Optional[EnterpriseScope] = None,
     ) -> List[Dict[str, Any]]:
         """List sessions with preview (first user message) and last active timestamp.
 
@@ -800,6 +943,13 @@ class SessionDB:
             placeholders = ",".join("?" for _ in exclude_sources)
             where_clauses.append(f"s.source NOT IN ({placeholders})")
             params.extend(exclude_sources)
+
+        scope_clauses, scope_params = self._build_scope_filters(
+            enterprise_scope,
+            table_alias="s",
+        )
+        where_clauses.extend(scope_clauses)
+        params.extend(scope_params)
 
         where_sql = f"WHERE {' AND '.join(where_clauses)}" if where_clauses else ""
         query = f"""
@@ -848,7 +998,10 @@ class SessionDB:
                 if s.get("end_reason") != "compression":
                     projected.append(s)
                     continue
-                tip_id = self.get_compression_tip(s["id"])
+                tip_id = self.get_compression_tip(
+                    s["id"],
+                    enterprise_scope=enterprise_scope,
+                )
                 if tip_id == s["id"]:
                     projected.append(s)
                     continue
@@ -1134,6 +1287,7 @@ class SessionDB:
         role_filter: List[str] = None,
         limit: int = 20,
         offset: int = 0,
+        enterprise_scope: Optional[EnterpriseScope] = None,
     ) -> List[Dict[str, Any]]:
         """
         Full-text search across session messages using FTS5.
@@ -1172,6 +1326,13 @@ class SessionDB:
             role_placeholders = ",".join("?" for _ in role_filter)
             where_clauses.append(f"m.role IN ({role_placeholders})")
             params.extend(role_filter)
+
+        scope_clauses, scope_params = self._build_scope_filters(
+            enterprise_scope,
+            table_alias="s",
+        )
+        where_clauses.extend(scope_clauses)
+        params.extend(scope_params)
 
         where_sql = " AND ".join(where_clauses)
         params.extend([limit, offset])
@@ -1223,6 +1384,12 @@ class SessionDB:
             if role_filter:
                 like_where.append(f"m.role IN ({','.join('?' for _ in role_filter)})")
                 like_params.extend(role_filter)
+            scope_clauses, scope_params = self._build_scope_filters(
+                enterprise_scope,
+                table_alias="s",
+            )
+            like_where.extend(scope_clauses)
+            like_params.extend(scope_params)
             like_sql = f"""
                 SELECT m.id, m.session_id, m.role,
                        substr(m.content,
