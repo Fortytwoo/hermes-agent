@@ -17,7 +17,6 @@ import time
 import unittest
 from unittest.mock import MagicMock, patch
 
-<<<<<<< HEAD
 from agent.tool_policy import ToolPolicy
 from agent.scope import EnterpriseScope, SessionAddress
 from tools.delegate_tool import (
