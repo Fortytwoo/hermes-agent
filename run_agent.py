@@ -83,6 +83,7 @@ from hermes_constants import OPENROUTER_BASE_URL
 
 # Agent internals extracted to agent/ package for modularity
 from agent.memory_manager import build_memory_context_block, sanitize_context
+from agent.memory_backend import MemoryBackend
 from agent.scope import EnterpriseScope, SessionAddress
 from agent.retry_utils import jittered_backoff
 from agent.error_classifier import classify_api_error, FailoverReason
@@ -1420,6 +1421,7 @@ class AIAgent:
         # needed later by the startup feasibility check.  Avoid exposing a
         # broad pseudo-public config object on the agent instance.
         self._aux_compression_context_length_config = None
+        self._memory_backend = MemoryBackend(get_hermes_home() / "memories")
 
         # Persistent memory (MEMORY.md + USER.md) -- loaded from disk
         self._memory_store = None
@@ -1441,6 +1443,9 @@ class AIAgent:
                     self._memory_store = MemoryStore(
                         memory_char_limit=mem_config.get("memory_char_limit", 2200),
                         user_char_limit=mem_config.get("user_char_limit", 1375),
+                        enterprise_scope=self.enterprise_scope,
+                        user_id=self._user_id,
+                        backend=self._memory_backend,
                     )
                     self._memory_store.load_from_disk()
             except Exception:
@@ -2840,6 +2845,9 @@ class AIAgent:
                         quiet_mode=True,
                         platform=self.platform,
                         provider=self.provider,
+                        user_id=self._user_id,
+                        enterprise_scope=self.enterprise_scope,
+                        session_address=self.session_address,
                     )
                     review_agent._memory_store = self._memory_store
                     review_agent._memory_enabled = self._memory_enabled
