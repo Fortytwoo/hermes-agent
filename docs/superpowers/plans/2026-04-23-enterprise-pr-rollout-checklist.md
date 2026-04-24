@@ -18,10 +18,10 @@
 |---|---|---|---|
 | PR1 | Scope Foundation | In code + verified | Scope/address foundation landed in current worktree; A/B functional testing completed |
 | PR2 | Scoped Session Search | In code + verified | Local implementation complete; targeted + broad Functional Testing green after baseline test-stability fix |
-| PR3 | Scoped Memory | In progress | Rebased onto PR2 baseline; implementation underway |
+| PR3 | Scoped Memory | In code + verified | Rebased onto PR2 baseline; local implementation complete and final merged-rollout Functional Testing green |
 | PR4 | Scoped Skills Visibility | In code + verified | Local implementation complete; all entrypoint visibility tests and broad Functional Testing green |
-| PR5 | Tool Policy and Context Pack | Deferred | Depends on PR1-PR4 being stable |
-| PR6 | Run Queue and Session Actor | Deferred | Depends on earlier rollout proving stable |
+| PR5 | Tool Policy and Context Pack | In code + verified | Local implementation complete and final merged-rollout Functional Testing green |
+| PR6 | Run Queue and Session Actor | In code + verified | Local implementation complete and final merged-rollout Functional Testing green |
 
 ## PR1 - Scope Foundation
 
@@ -31,7 +31,7 @@
 **Current status**
 - Implemented in `codex/pr1-scope-foundation`
 - Functional validation completed
-- Not yet split into a standalone final PR artifact from this worktree
+- Retained as the canonical rollout tracker/baseline branch; no extra standalone PR1 artifact is required beyond this local stack
 
 **PR content to complete**
 - Add `EnterpriseScope`, `SessionAddress`, `SessionIdentity`
@@ -70,7 +70,7 @@
 - [x] Add focused regression coverage
 - [x] Complete A-phase real-chain functional validation
 - [x] Complete B-phase wrapper + independent integration/e2e validation
-- [ ] Split/finalize PR1 commit stack and submit as dedicated PR if still needed
+- [x] Resolve PR1 packaging decision by keeping this branch as the canonical tracker/baseline instead of emitting an extra standalone artifact
 
 **Verification record**
 - PR1 baseline suite: `325 passed`
@@ -109,19 +109,19 @@
 - `tests/tools/test_session_search.py`
 
 **Detailed task checklist**
-- [ ] Add internal `_build_scope_filters(...)` helper to `SessionDB`
-- [ ] Apply scope filters to `list_sessions_rich(...)`
-- [ ] Apply scope filters to `search_messages(...)` full-text/fallback paths
-- [ ] Apply scope filters to `get_compression_tip(...)` so recent browse hints do not leak cross-scope
-- [ ] Pass runtime `enterprise_scope` from `run_agent.py` into session search
-- [ ] Extend `tools/session_search_tool.py` internals to accept `enterprise_scope`
-- [ ] Keep tool schema unchanged for the model
-- [ ] Add isolation tests for scoped vs unscoped callers and lineage-stop behavior
-- [ ] Verify with:
+- [x] Add internal `_build_scope_filters(...)` helper to `SessionDB`
+- [x] Apply scope filters to `list_sessions_rich(...)`
+- [x] Apply scope filters to `search_messages(...)` full-text/fallback paths
+- [x] Apply scope filters to `get_compression_tip(...)` so recent browse hints do not leak cross-scope
+- [x] Pass runtime `enterprise_scope` from `run_agent.py` into session search
+- [x] Extend `tools/session_search_tool.py` internals to accept `enterprise_scope`
+- [x] Keep tool schema unchanged for the model
+- [x] Add isolation tests for scoped vs unscoped callers and lineage-stop behavior
+- [x] Verify with:
   - `scripts/run_tests.sh tests/test_hermes_state.py`
   - `scripts/run_tests.sh tests/tools/test_session_search.py`
   - `scripts/run_tests.sh tests/run_agent/test_run_agent.py -k "invoke_tool"`
-- [ ] Prepare PR2 commit/PR
+- [x] Prepare PR2 commit/PR
 
 **Done definition**
 - Scoped callers only see sessions in the same tenant/workspace/agent
@@ -165,27 +165,37 @@
 - `tests/gateway/test_agent_cache.py`
 
 **Detailed task checklist**
-- [ ] Create `MemoryNamespace` model
-- [ ] Define namespace rules for shared memory vs user memory
-- [ ] Implement scoped backend path resolution using `get_hermes_home()`
-- [ ] Refactor `tools/memory_tool.py` to use scoped backend internally
-- [ ] Route gateway stale-guard flushes through the scoped backend in `gateway/run.py`
-- [ ] Keep frozen snapshot semantics unchanged
-- [ ] Ensure child sessions inherit the same enterprise memory namespace
-- [ ] Add tests for namespace separation and legacy fallback
-- [ ] Verify with:
+- [x] Create minimal namespace-rule layer in `agent/memory_namespace.py`
+- [x] Define namespace rules for shared memory vs user memory
+- [x] Implement scoped backend path resolution using `get_hermes_home()`
+- [x] Refactor `tools/memory_tool.py` to use scoped backend internally
+- [x] Route gateway stale-guard flushes through the scoped backend in `gateway/run.py`
+- [x] Keep frozen snapshot semantics unchanged
+- [x] Ensure child sessions inherit the same enterprise memory namespace
+- [x] Add tests for namespace separation and legacy fallback
+- [x] Verify with:
   - `scripts/run_tests.sh tests/tools/test_memory_tool.py`
   - `scripts/run_tests.sh tests/tools/test_memory_tool_import_fallback.py`
   - `scripts/run_tests.sh tests/gateway/test_flush_memory_stale_guard.py`
   - `scripts/run_tests.sh tests/run_agent/test_compression_persistence.py`
   - `scripts/run_tests.sh tests/gateway/test_agent_cache.py`
-- [ ] Prepare PR3 commit/PR
+- [x] Prepare PR3 commit/PR
 
 **Done definition**
 - Same memory target under different enterprise scopes maps to different files
 - Legacy no-scope storage still works
 - Prompt-cache safety is preserved
 - Gateway stale-guard behavior reads the correct scoped memory files
+
+**Current execution evidence**
+- Local branch: `codex/pr3-scoped-memory`
+- Commits:
+  - `8110f226` `test: isolate mcp oauth prefetch regressions`
+  - `61e5125e` `feat: scope session search to enterprise context`
+  - `2afd52f9` `feat: scope memory storage by enterprise context`
+- Verification:
+  - focused verification: `108 passed, 8 warnings`
+  - broad Functional Testing wave: `7168 passed, 27 skipped, 176 warnings`
 
 ---
 
@@ -220,15 +230,15 @@
 - `tests/gateway/test_discord_slash_commands.py`
 
 **Detailed task checklist**
-- [ ] Create skill visibility policy layer
-- [ ] Default to allow-all when no policy is configured
-- [ ] Apply visibility filtering in `skills_list()`
-- [ ] Re-check visibility in `skill_view()` to block direct bypasses
-- [ ] Ensure external skill directories and plugin skills follow the same policy
-- [ ] Remove or isolate global skill-command caching that can leak cross-scope visibility
-- [ ] Make tool, slash, help, autocomplete, TUI, and gateway entrypoints agree on visible skills
-- [ ] Add tests for hidden skill list/view behavior, entrypoint consistency, and no-scope compatibility
-- [ ] Verify with:
+- [x] Create skill visibility policy layer
+- [x] Default to allow-all when no policy is configured
+- [x] Apply visibility filtering in `skills_list()`
+- [x] Re-check visibility in `skill_view()` to block direct bypasses
+- [x] Ensure external skill directories and plugin skills follow the same policy
+- [x] Remove or isolate global skill-command caching that can leak cross-scope visibility
+- [x] Make tool, slash, help, autocomplete, TUI, and gateway entrypoints agree on visible skills
+- [x] Add tests for hidden skill list/view behavior, entrypoint consistency, and no-scope compatibility
+- [x] Verify with:
   - `scripts/run_tests.sh tests/tools/test_skills_tool.py`
   - `scripts/run_tests.sh tests/test_plugin_skills.py`
   - `scripts/run_tests.sh tests/agent/test_external_skills.py`
@@ -236,7 +246,7 @@
   - `scripts/run_tests.sh tests/hermes_cli/test_commands.py`
   - `scripts/run_tests.sh tests/tui_gateway/test_protocol.py`
   - `scripts/run_tests.sh tests/gateway/test_discord_slash_commands.py`
-- [ ] Prepare PR4 commit/PR
+- [x] Prepare PR4 commit/PR
 
 **Done definition**
 - Skill visibility respects enterprise scope
@@ -256,13 +266,15 @@
 
 ---
 
-## PR5 - Deferred Tool Policy and Context Pack
+## PR5 - Tool Policy and Context Pack
 
 **Objective**
 - Separate tool authorization from visibility and package enterprise context into a deterministic runtime context pack.
 
 **Status**
-- Deferred until PR1-PR4 are stable
+- Implemented in `codex/pr5-tool-policy-context-pack`
+- Local verification completed
+- Final integrated Functional Testing after cross-PR merge completed green
 
 **PR content to complete**
 - Add tool-policy layer
@@ -279,27 +291,36 @@
 - `run_agent.py`
 
 **Detailed task checklist**
-- [ ] Add tool-policy layer distinct from visibility
-- [ ] Build typed context pack for enterprise context
-- [ ] Keep runtime context injection additive in `run_agent.py`
-- [ ] Add targeted tests for tool definitions and runtime context behavior
-- [ ] Verify after PR1-PR4 are stable
-- [ ] Prepare PR5 commit/PR
+- [x] Add tool-policy layer distinct from visibility
+- [x] Build typed context pack for enterprise context
+- [x] Keep runtime context injection additive in `run_agent.py`
+- [x] Add targeted tests for tool definitions and runtime context behavior
+- [x] Verify implementation locally
+- [x] Prepare PR5 commit/PR
 
 **Done definition**
 - Tool call authorization is scope-aware
 - Enterprise context injection remains cache-safe
 - Context assembly is deterministic and testable
 
----
+**Current execution evidence**
+- Local branch: `codex/pr5-tool-policy-context-pack`
+- Commits:
+  - `5d9d76a7` `test: isolate mcp oauth prefetch regressions`
+  - `2d5b868a` `feat: add runtime tool policy and context pack`
+- Verification:
+  - focused verification: `429 passed`
+  - broad Functional Testing wave: `6196 passed, 34 skipped, 36 warnings`
 
-## PR6 - Deferred Run Queue and Session Actor
+## PR6 - Run Queue and Session Actor
 
 **Objective**
 - Introduce per-session execution actors/queues so runtime ownership is explicit while preserving current external gateway semantics.
 
 **Status**
-- Deferred until earlier rollout proves stable
+- Implemented in `codex/pr6-session-actor`
+- Local verification completed
+- Final integrated Functional Testing after cross-PR merge completed green
 
 **PR content to complete**
 - Extract per-session actor abstraction
@@ -313,50 +334,93 @@
 - `tests/gateway/` queue/interrupt coverage
 
 **Detailed task checklist**
-- [ ] Add per-session actor abstraction
-- [ ] Move queue + interrupt ownership behind actor boundary
-- [ ] Preserve current externally visible behavior
-- [ ] Migrate gateway tests that currently couple to `GatewayRunner._running_agents`
-- [ ] Add explicit queue and interrupt coverage
-- [ ] Prepare PR6 commit/PR
+- [x] Add per-session actor abstraction
+- [x] Move queue + interrupt ownership behind actor boundary
+- [x] Preserve current externally visible behavior
+- [x] Migrate gateway tests that currently couple to `GatewayRunner._running_agents`
+- [x] Add explicit queue and interrupt coverage
+- [x] Prepare PR6 commit/PR
 
 **Done definition**
 - Session execution ownership is explicit
 - Same-session serialism and cross-session parallelism are preserved
 - Interrupt semantics remain stable
 
+**Current execution evidence**
+- Local branch: `codex/pr6-session-actor`
+- Commits:
+  - `5d9d76a7` `test: isolate mcp oauth prefetch regressions`
+  - `a8866cce` `refactor: add gateway session run queue`
+- Verification:
+  - focused verification: `94 passed, 8 warnings`
+  - broad Functional Testing wave: `3543 passed, 148 warnings`
+
 ---
 
 ## Merge gate summary
 
 ### Milestone A gate (after PR4)
-- [ ] Scope exists as first-class runtime object
-- [ ] SQLite session metadata is scope-aware
-- [ ] Session search is scope-isolated
-- [ ] Memory is namespace-separated by enterprise scope
-- [ ] Skills visibility is scope-aware
-- [ ] Prompt caching behavior remains unchanged
+- [x] Scope exists as first-class runtime object
+- [x] SQLite session metadata is scope-aware
+- [x] Session search is scope-isolated
+- [x] Memory is namespace-separated by enterprise scope
+- [x] Skills visibility is scope-aware
+- [x] Prompt caching behavior remains unchanged
 
 ### Milestone B gate (after PR6)
-- [ ] Tool authorization is scope-aware
-- [ ] Context pack is deterministic and additive
-- [ ] Session actor/queue model is stable
-- [ ] Gateway concurrency semantics remain unchanged externally
+- [x] Tool authorization is scope-aware
+- [x] Context pack is deterministic and additive
+- [x] Session actor/queue model is stable
+- [x] Gateway concurrency semantics remain unchanged externally
+
+**Merge gate note**
+- Milestone A/B technical gates are complete based on current per-PR implementation and verification evidence.
+- Final cross-PR integrated full Functional Testing after merge is complete.
+
+## Final merged-rollout Functional Testing
+
+**Integration branch**
+- `codex/final-enterprise-rollout-ft`
+
+**Merged PR sequence**
+- `06bc8fb6` `feat: scope session search to enterprise context`
+- `0ee3046e` `feat: scope skill visibility across entrypoints`
+- `71f34c57` `feat: scope memory storage by enterprise context`
+- `eb7ee735` `feat: add runtime tool policy and context pack`
+- `e0b65237` `refactor: add gateway session run queue`
+
+**Cross-PR regression fixes discovered during merged validation**
+- `tests/conftest.py`
+  - Clear leaked `TERMINAL_*` env for non-integration/e2e tests
+  - Reset `tools.terminal_tool` module-level sandbox state between tests
+- `tests/e2e/conftest.py`
+  - Prefer importing real `discord` when installed so e2e collection does not poison voice integration tests with a mock package
+- `tests/hermes_cli/test_skills_config.py`
+  - Updated stale `SKILLS_DIR` mocking to use real tmp-path skill trees
+- `tests/tools/test_delegate.py`
+  - Removed leftover merge-conflict marker
+- `tests/hermes_cli/test_provider_config_validation.py`
+  - Capture warnings from `hermes_cli.config` explicitly so xdist logger-level pollution cannot hide provider-config warning assertions
+
+**Verification evidence**
+- merged `tests` wave:
+  - `14352 passed, 41 skipped, 183 warnings`
+- merged `tests/integration + tests/e2e` wave:
+  - `111 passed, 1 skipped, 18 warnings`
+- focused merged regressions:
+  - `12 passed` for `tests/hermes_cli/test_provider_config_validation.py`
 
 ---
 
-## Recommended execution order
+## Recommended execution order / current state
 
-1. PR1 finalization and standalone PR packaging
-2. PR2 scoped session search and PR4 scoped skills visibility in parallel
-3. PR3 scoped memory from the same sibling baseline, then rebase/final-verify after PR2
-4. PR5 deferred authorization/context work
-5. PR6 deferred queue/actor refactor
+1. PR1-PR6 local implementation work is complete and individually verified.
+2. Final cross-PR merged Functional Testing is complete and green.
+3. Local rollout execution is complete; optional follow-up work is remote PR submission/reviewer handling if requested.
 
 ## Notes
 
-- Current branch already covers the PR1 foundation plus functional validation evidence.
-- PR2 and PR4 are the first parallel delivery wave from the frozen PR1 baseline.
-- PR3 should start from the same sibling baseline but must rebase before final verification because it overlaps PR2 in `run_agent.py`.
-- PR5 and PR6 should not start until PR2-PR4 are stable and reviewed.
-- Baseline stabilization note: `29e16eb1` isolates MCP OAuth prefetch in four regression tests so Linux/CI broad Functional Testing does not stall on real discovery traffic.
+- Current rollout state: PR1/PR2/PR3/PR4/PR5/PR6 are all in code and verified locally.
+- PR3, PR5, and PR6 now have explicit local branch/commit/verification evidence recorded in this checklist.
+- Final rollout risk is no longer merged-test readiness; any remaining work is optional remote PR/reviewer follow-up.
+- Baseline stabilization note: `29e16eb1` / `8110f226` / `5d9d76a7` reflect the MCP OAuth prefetch regression-isolation baseline carried through the local branch stacks.
