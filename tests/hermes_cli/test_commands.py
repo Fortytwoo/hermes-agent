@@ -755,6 +755,32 @@ class TestTelegramMenuCommands:
         assert "my_enabled_skill" in menu_names
         assert "my_disabled_skill" not in menu_names
 
+    def test_scope_visibility_filters_skill_menu_entries(self, tmp_path, monkeypatch):
+        from unittest.mock import patch
+
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+        monkeypatch.setenv("HERMES_SCOPE_TENANT_ID", "tenant-b")
+
+        skill_dir = tmp_path / "skills" / "tenant-a-only"
+        skill_dir.mkdir(parents=True, exist_ok=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            "name: tenant-a-only\n"
+            "description: Hidden outside tenant-a\n"
+            "metadata:\n"
+            "  hermes:\n"
+            "    visibility:\n"
+            "      tenants: [tenant-a]\n"
+            "---\n\n"
+            "Body.\n"
+        )
+
+        with patch("tools.skills_tool.SKILLS_DIR", tmp_path / "skills"):
+            menu, _ = telegram_menu_commands(max_commands=100)
+
+        menu_names = {name for name, _ in menu}
+        assert "tenant_a_only" not in menu_names
+
     def test_special_chars_in_skill_names_sanitized(self, tmp_path, monkeypatch):
         """Skills with +, /, or other special chars produce valid Telegram names."""
         from unittest.mock import patch
