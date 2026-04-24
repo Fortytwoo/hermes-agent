@@ -19,28 +19,27 @@ def _hermes_home_path() -> Path:
 def build_write_denied_paths(home: str) -> set[str]:
     """Return exact sensitive paths that must never be written."""
     hermes_home = _hermes_home_path()
-    return {
-        os.path.realpath(p)
-        for p in [
-            os.path.join(home, ".ssh", "authorized_keys"),
-            os.path.join(home, ".ssh", "id_rsa"),
-            os.path.join(home, ".ssh", "id_ed25519"),
-            os.path.join(home, ".ssh", "config"),
-            str(hermes_home / ".env"),
-            os.path.join(home, ".bashrc"),
-            os.path.join(home, ".zshrc"),
-            os.path.join(home, ".profile"),
-            os.path.join(home, ".bash_profile"),
-            os.path.join(home, ".zprofile"),
-            os.path.join(home, ".netrc"),
-            os.path.join(home, ".pgpass"),
-            os.path.join(home, ".npmrc"),
-            os.path.join(home, ".pypirc"),
-            "/etc/sudoers",
-            "/etc/passwd",
-            "/etc/shadow",
-        ]
-    }
+    paths = [
+        os.path.join(home, ".ssh", "authorized_keys"),
+        os.path.join(home, ".ssh", "id_rsa"),
+        os.path.join(home, ".ssh", "id_ed25519"),
+        os.path.join(home, ".ssh", "config"),
+        str(hermes_home / ".env"),
+        os.path.join(home, ".hermes", ".env"),
+        os.path.join(home, ".bashrc"),
+        os.path.join(home, ".zshrc"),
+        os.path.join(home, ".profile"),
+        os.path.join(home, ".bash_profile"),
+        os.path.join(home, ".zprofile"),
+        os.path.join(home, ".netrc"),
+        os.path.join(home, ".pgpass"),
+        os.path.join(home, ".npmrc"),
+        os.path.join(home, ".pypirc"),
+        "/etc/sudoers",
+        "/etc/passwd",
+        "/etc/shadow",
+    ]
+    return {os.path.realpath(p) for p in paths}
 
 
 def build_write_denied_prefixes(home: str) -> list[str]:

@@ -274,6 +274,8 @@ from gateway.config import (
     GatewayConfig,
     load_gateway_config,
 )
+from agent.scope import parse_scoped_session_key
+from agent.scope_resolver import resolve_enterprise_scope, resolve_session_address
 from gateway.session import (
     SessionStore,
     SessionSource,
@@ -541,19 +543,8 @@ def _resolve_hermes_bin() -> Optional[list[str]]:
     return None
 
 
-def _parse_session_key(session_key: str) -> "dict | None":
-    """Parse a session key into its component parts.
-
-    Session keys follow the format
-    ``agent:main:{platform}:{chat_type}:{chat_id}[:{extra}...]``.
-    Returns a dict with ``platform``, ``chat_type``, ``chat_id``, and
-    optionally ``thread_id`` keys, or None if the key doesn't match.
-
-    The 6th element is only returned as ``thread_id`` for chat types where
-    it is unambiguous (``dm`` and ``thread``).  For group/channel sessions
-    the suffix may be a user_id (per-user isolation) rather than a
-    thread_id, so we leave ``thread_id`` out to avoid mis-routing.
-    """
+def _parse_legacy_session_key(session_key: str) -> "dict | None":
+    """Parse the legacy ``agent:main:...`` session-key format."""
     parts = session_key.split(":")
     if len(parts) >= 5 and parts[0] == "agent" and parts[1] == "main":
         result = {
@@ -565,6 +556,22 @@ def _parse_session_key(session_key: str) -> "dict | None":
             result["thread_id"] = parts[5]
         return result
     return None
+
+
+def _parse_session_key(session_key: str) -> "dict | None":
+    """Parse legacy or scoped session keys into the legacy routing dict shape."""
+    scoped = parse_scoped_session_key(session_key)
+    if scoped:
+        _, session_address = scoped
+        result = {
+            "platform": session_address.platform,
+            "chat_type": session_address.chat_type,
+            "chat_id": session_address.chat_id,
+        }
+        if session_address.thread_id:
+            result["thread_id"] = session_address.thread_id
+        return result
+    return _parse_legacy_session_key(session_key)
 
 
 def _format_gateway_process_notification(evt: dict) -> "str | None":
@@ -4274,6 +4281,8 @@ class GatewayRunner:
                                     skip_memory=True,
                                     enabled_toolsets=["memory"],
                                     session_id=session_entry.session_id,
+                                    enterprise_scope=session_entry.enterprise_scope,
+                                    session_address=session_entry.session_address,
                                 )
                                 try:
                                     _hyg_agent._print_fn = lambda *a, **kw: None
@@ -4413,6 +4422,7 @@ class GatewayRunner:
                 source=source,
                 session_id=session_entry.session_id,
                 session_key=session_key,
+                session_entry=session_entry,
                 run_generation=run_generation,
                 event_message_id=event.message_id,
                 channel_prompt=event.channel_prompt,
@@ -6456,6 +6466,8 @@ class GatewayRunner:
                     session_id=task_id,
                     platform=platform_key,
                     user_id=source.user_id,
+                    enterprise_scope=resolve_enterprise_scope(),
+                    session_address=resolve_session_address(source),
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
@@ -6637,6 +6649,8 @@ class GatewayRunner:
                     provider_data_collection=pr.get("data_collection"),
                     session_id=task_id,
                     platform=platform_key,
+                    enterprise_scope=session_entry.enterprise_scope,
+                    session_address=session_entry.session_address,
                     session_db=None,
                     fallback_model=self._fallback_model,
                     skip_memory=True,
@@ -6978,6 +6992,8 @@ class GatewayRunner:
                 skip_memory=True,
                 enabled_toolsets=["memory"],
                 session_id=session_entry.session_id,
+                enterprise_scope=session_entry.enterprise_scope,
+                session_address=session_entry.session_address,
             )
             try:
                 tmp_agent._print_fn = lambda *a, **kw: None
@@ -8276,6 +8292,8 @@ class GatewayRunner:
         derived_platform = ""
         derived_chat_type = ""
         derived_chat_id = ""
+        derived_thread_id = ""
+        derived_user_id = ""
 
         if session_key:
             try:
@@ -8295,6 +8313,13 @@ class GatewayRunner:
                 derived_platform = _parsed["platform"]
                 derived_chat_type = _parsed["chat_type"]
                 derived_chat_id = _parsed["chat_id"]
+                derived_thread_id = _parsed.get("thread_id") or ""
+
+            _scoped = parse_scoped_session_key(session_key)
+            if _scoped:
+                _, _address = _scoped
+                derived_thread_id = _address.thread_id or derived_thread_id
+                derived_user_id = _address.user_id or derived_user_id
 
         platform_name = str(evt.get("platform") or derived_platform or "").strip().lower()
         chat_type = str(evt.get("chat_type") or derived_chat_type or "").strip().lower()
@@ -8315,8 +8340,8 @@ class GatewayRunner:
             platform=platform,
             chat_id=chat_id,
             chat_type=chat_type,
-            thread_id=str(evt.get("thread_id") or "").strip() or None,
-            user_id=str(evt.get("user_id") or "").strip() or None,
+            thread_id=str(evt.get("thread_id") or derived_thread_id or "").strip() or None,
+            user_id=str(evt.get("user_id") or derived_user_id or "").strip() or None,
             user_name=str(evt.get("user_name") or "").strip() or None,
         )
 
@@ -9138,6 +9163,7 @@ class GatewayRunner:
         source: SessionSource,
         session_id: str,
         session_key: str = None,
+        session_entry=None,
         run_generation: Optional[int] = None,
         _interrupt_depth: int = 0,
         event_message_id: Optional[str] = None,
@@ -9178,6 +9204,12 @@ class GatewayRunner:
         
         user_config = _load_gateway_config()
         platform_key = _platform_config_key(source.platform)
+
+        if session_entry is None and getattr(self, "session_store", None) is not None:
+            try:
+                session_entry = self.session_store.get_or_create_session(source)
+            except Exception:
+                session_entry = None
 
         from hermes_cli.tools_config import _get_platform_tools
         enabled_toolsets = sorted(_get_platform_tools(user_config, platform_key))
@@ -9699,6 +9731,8 @@ class GatewayRunner:
                     platform=platform_key,
                     user_id=source.user_id,
                     gateway_session_key=session_key,
+                    enterprise_scope=getattr(session_entry, "enterprise_scope", None),
+                    session_address=getattr(session_entry, "session_address", None),
                     session_db=self._session_db,
                     fallback_model=self._fallback_model,
                 )
@@ -10618,6 +10652,7 @@ class GatewayRunner:
                     source=next_source,
                     session_id=session_id,
                     session_key=session_key,
+                    session_entry=session_entry,
                     run_generation=run_generation,
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,

@@ -22,6 +22,7 @@ import sqlite3
 import threading
 import time
 from pathlib import Path
+from agent.scope import EnterpriseScope, SessionAddress
 from hermes_constants import get_hermes_home
 from typing import Any, Callable, Dict, List, Optional, TypeVar
 
@@ -31,7 +32,7 @@ T = TypeVar("T")
 
 DEFAULT_DB_PATH = get_hermes_home() / "state.db"
 
-SCHEMA_VERSION = 6
+SCHEMA_VERSION = 7
 
 SCHEMA_SQL = """
 CREATE TABLE IF NOT EXISTS schema_version (
@@ -65,6 +66,12 @@ CREATE TABLE IF NOT EXISTS sessions (
     cost_source TEXT,
     pricing_version TEXT,
     title TEXT,
+    tenant_id TEXT,
+    workspace_id TEXT,
+    agent_id TEXT,
+    chat_id TEXT,
+    thread_id TEXT,
+    chat_type TEXT,
     FOREIGN KEY (parent_session_id) REFERENCES sessions(id)
 );
 
@@ -329,6 +336,27 @@ class SessionDB:
                     except sqlite3.OperationalError:
                         pass  # Column already exists
                 cursor.execute("UPDATE schema_version SET version = 6")
+            if current_version < 7:
+                for col_name, col_type in [
+                    ("tenant_id", "TEXT"),
+                    ("workspace_id", "TEXT"),
+                    ("agent_id", "TEXT"),
+                    ("chat_id", "TEXT"),
+                    ("thread_id", "TEXT"),
+                    ("chat_type", "TEXT"),
+                ]:
+                    try:
+                        safe = col_name.replace('"', '""')
+                        cursor.execute(
+                            f'ALTER TABLE sessions ADD COLUMN "{safe}" {col_type}'
+                        )
+                    except sqlite3.OperationalError:
+                        pass
+                cursor.execute(
+                    "CREATE INDEX IF NOT EXISTS idx_sessions_scope "
+                    "ON sessions(tenant_id, workspace_id, agent_id, started_at DESC)"
+                )
+                cursor.execute("UPDATE schema_version SET version = 7")
 
         # Unique title index — always ensure it exists (safe to run after migrations
         # since the title column is guaranteed to exist at this point)
@@ -336,6 +364,13 @@ class SessionDB:
             cursor.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS idx_sessions_title_unique "
                 "ON sessions(title) WHERE title IS NOT NULL"
+            )
+        except sqlite3.OperationalError:
+            pass  # Index already exists
+        try:
+            cursor.execute(
+                "CREATE INDEX IF NOT EXISTS idx_sessions_scope "
+                "ON sessions(tenant_id, workspace_id, agent_id, started_at DESC)"
             )
         except sqlite3.OperationalError:
             pass  # Index already exists
@@ -352,6 +387,22 @@ class SessionDB:
     # Session lifecycle
     # =========================================================================
 
+    @staticmethod
+    def _session_scope_columns(
+        enterprise_scope: Optional[EnterpriseScope],
+        session_address: Optional[SessionAddress],
+    ) -> tuple[Optional[str], Optional[str], Optional[str], Optional[str], Optional[str], Optional[str]]:
+        scope = enterprise_scope
+        address = session_address
+        return (
+            (scope.tenant_id or None) if scope else None,
+            (scope.workspace_id or None) if scope else None,
+            ((scope.agent_id or "main") if scope else None),
+            (address.chat_id or None) if address else None,
+            (address.thread_id or None) if address else None,
+            (address.chat_type or None) if address else None,
+        )
+
     def create_session(
         self,
         session_id: str,
@@ -361,13 +412,22 @@ class SessionDB:
         system_prompt: str = None,
         user_id: str = None,
         parent_session_id: str = None,
+        *,
+        enterprise_scope: Optional[EnterpriseScope] = None,
+        session_address: Optional[SessionAddress] = None,
     ) -> str:
         """Create a new session record. Returns the session_id."""
+        session_scope_columns = self._session_scope_columns(
+            enterprise_scope,
+            session_address,
+        )
+
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions (id, source, user_id, model, model_config,
-                   system_prompt, parent_session_id, started_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                   system_prompt, parent_session_id, started_at, tenant_id, workspace_id,
+                   agent_id, chat_id, thread_id, chat_type)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     source,
@@ -377,6 +437,7 @@ class SessionDB:
                     system_prompt,
                     parent_session_id,
                     time.time(),
+                    *session_scope_columns,
                 ),
             )
         self._execute_write(_do)
@@ -513,6 +574,9 @@ class SessionDB:
         session_id: str,
         source: str = "unknown",
         model: str = None,
+        *,
+        enterprise_scope: Optional[EnterpriseScope] = None,
+        session_address: Optional[SessionAddress] = None,
     ) -> None:
         """Ensure a session row exists, creating it with minimal metadata if absent.
 
@@ -520,12 +584,18 @@ class SessionDB:
         create_session() call (e.g. transient SQLite lock at agent startup).
         INSERT OR IGNORE is safe to call even when the row already exists.
         """
+        session_scope_columns = self._session_scope_columns(
+            enterprise_scope,
+            session_address,
+        )
+
         def _do(conn):
             conn.execute(
                 """INSERT OR IGNORE INTO sessions
-                   (id, source, model, started_at)
-                   VALUES (?, ?, ?, ?)""",
-                (session_id, source, model, time.time()),
+                   (id, source, model, started_at, tenant_id, workspace_id,
+                    agent_id, chat_id, thread_id, chat_type)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (session_id, source, model, time.time(), *session_scope_columns),
             )
         self._execute_write(_do)
 
